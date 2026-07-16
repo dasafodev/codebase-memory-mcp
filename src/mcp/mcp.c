@@ -4956,15 +4956,105 @@ static char *get_project_root(cbm_mcp_server_t *srv, const char *project) {
 
 /* ── index_repository ─────────────────────────────────────────── */
 
+/* Resolve the cross-repo SOURCE project by matching a stored project's
+ * root_path to repo_path, so a project indexed under a CUSTOM name (e.g.
+ * "wagon_flutter") still cross-links instead of pointing at an empty
+ * path-derived db. Scans the cache dir, opens each project db read-only, and
+ * compares canonicalized root paths. Prefers a project whose name differs from
+ * `derived` (the friendly custom name over the path-derived one). Returns a
+ * heap string to free, or NULL when no stored root matches repo_path. */
+static char *cross_repo_source_project(const char *repo_path, const char *derived) {
+    char canon[CBM_SZ_4K];
+    if (!cbm_canonical_path(repo_path, canon, sizeof(canon))) {
+        snprintf(canon, sizeof(canon), "%s", repo_path);
+    }
+    char dir_path[CBM_SZ_4K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        return NULL;
+    }
+    char *friendly = NULL;
+    char *derived_match = NULL;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        const char *n = entry->name;
+        size_t len = strlen(n);
+        if (!is_project_db_file(n, len)) {
+            continue;
+        }
+        char full_path[CBM_SZ_4K];
+        snprintf(full_path, sizeof(full_path), "%s/%s", dir_path, n);
+        cbm_store_t *st = cbm_store_open_path_query(full_path);
+        if (!st) {
+            continue;
+        }
+        cbm_project_t *projs = NULL;
+        int pc = 0;
+        if (cbm_store_list_projects(st, &projs, &pc) == CBM_STORE_OK) {
+            for (int i = 0; i < pc; i++) {
+                if (!projs[i].name || !projs[i].name[0] || strstr(projs[i].name, "::")) {
+                    continue; /* skip internal shadow (miss-graph) rows */
+                }
+                if (!projs[i].root_path || !projs[i].root_path[0]) {
+                    continue;
+                }
+                char rc[CBM_SZ_4K];
+                if (!cbm_canonical_path(projs[i].root_path, rc, sizeof(rc))) {
+                    snprintf(rc, sizeof(rc), "%s", projs[i].root_path);
+                }
+                if (strcmp(rc, canon) != 0) {
+                    continue;
+                }
+                if (derived && strcmp(projs[i].name, derived) == 0) {
+                    if (!derived_match) {
+                        derived_match = heap_strdup(projs[i].name);
+                    }
+                } else if (!friendly) {
+                    friendly = heap_strdup(projs[i].name);
+                }
+            }
+        }
+        cbm_store_free_projects(projs, pc);
+        cbm_store_close(st);
+    }
+    cbm_closedir(d);
+    if (friendly) {
+        free(derived_match);
+        return friendly;
+    }
+    return derived_match;
+}
+
 /* Handle mode="cross-repo-intelligence" — extract to reduce complexity. */
 static char *handle_cross_repo_mode(const char *repo_path, const char *args) {
-    char *project = heap_strdup(cbm_project_name_from_path(repo_path));
+    yyjson_doc *jdoc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *jroot = jdoc ? yyjson_doc_get_root(jdoc) : NULL;
+
+    /* Resolve the SOURCE project name. Priority: (1) explicit `name` arg,
+     * (2) the stored project whose root_path == repo_path (so a custom-named
+     * project still cross-links), (3) the path-derived name (legacy default). */
+    char *project = NULL;
+    yyjson_val *nval = jroot ? yyjson_obj_get(jroot, "name") : NULL;
+    const char *nstr = nval ? yyjson_get_str(nval) : NULL;
+    if (nstr && nstr[0]) {
+        project = heap_strdup(nstr);
+    } else {
+        char *derived = cbm_project_name_from_path(repo_path);
+        if (derived) {
+            project = cross_repo_source_project(repo_path, derived);
+            if (!project) {
+                project = derived; /* transfer ownership */
+                derived = NULL;
+            }
+            free(derived);
+        }
+    }
     if (!project) {
+        yyjson_doc_free(jdoc);
         return cbm_mcp_text_result("cannot derive project name", true);
     }
 
-    yyjson_doc *jdoc = yyjson_read(args, strlen(args), 0);
-    yyjson_val *jroot = jdoc ? yyjson_doc_get_root(jdoc) : NULL;
     yyjson_val *tp_arr = jroot ? yyjson_obj_get(jroot, "target_projects") : NULL;
 
     if (!tp_arr || !yyjson_is_arr(tp_arr) || yyjson_arr_size(tp_arr) == 0) {

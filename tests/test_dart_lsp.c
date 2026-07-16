@@ -881,6 +881,281 @@ TEST(dartlsp_package_import_includes_lib_root) {
     PASS();
 }
 
+TEST(dartlsp_stdlib_string_split_chain) {
+    CBMFileResult *r = extract_dart_lsp("String run() => 'a,b'.split(',').first.trim();\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "String.split"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "List.first"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "String.trim"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_list_map_to_list) {
+    CBMFileResult *r =
+        extract_dart_lsp("List run() => [1, 2].map((value) => value).toList();\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "List.map"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Iterable.toList"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_iterable_generic_property_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "String run(Iterable<String> values) => values.toList().first.toUpperCase();\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Iterable.toList"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "List.first"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "String.toUpperCase"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_json_functions) {
+    CBMFileResult *r = extract_dart_lsp("import 'dart:convert';\n"
+                                        "String run(Object value) { jsonDecode('{}'); return "
+                                        "jsonEncode(value); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "dart.convert.jsonDecode"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "dart.convert.jsonEncode"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_prefixed_json_functions) {
+    CBMFileResult *r = extract_dart_lsp("import 'dart:convert' as convert;\n"
+                                        "String run(Object value) => convert.jsonEncode(value);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "dart.convert.jsonEncode"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_future_then_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "Future<String> run(Future<int> value) => value.then((number) => '$number')"
+        ".whenComplete(() {});\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Future.then"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Future.whenComplete"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_io_file_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'dart:io';\nFuture<String> run() => File('a.txt').readAsString();\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "dart.io.File"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "File.readAsString"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_math_random) {
+    CBMFileResult *r =
+        extract_dart_lsp("import 'dart:math';\nint run() => Random().nextInt(10);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "dart.math.Random"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Random.nextInt"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_stdlib_typed_data) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'dart:typed_data';\nByteBuffer run() => Uint8List(4).buffer;\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Uint8List"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Uint8List.buffer"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_flutter_navigator_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\n"
+        "Future<void> run(BuildContext context, Route<void> route) => "
+        "Navigator.of(context).push(route);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Navigator.of"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "NavigatorState.push"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_flutter_bare_set_state) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\n"
+        "class Screen extends StatefulWidget {}\n"
+        "class ScreenState extends State<Screen> { void refresh() { setState(() {}); } }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "refresh", "State.setState"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_flutter_widget_constructors) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\n"
+        "Widget run() => Container(child: Row(children: [Text('hello')]));\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "material.Container"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "material.Row"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "material.Text"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_flutter_named_constructors_and_color) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\n"
+        "Widget run() { final color = Colors.red; final padding = EdgeInsets.all(8); "
+        "return ListView.builder(itemBuilder: (_, i) => Text('$i')); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Colors.red"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "EdgeInsets.all"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "ListView.builder"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_flutter_dialog_functions) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\n"
+        "void run(BuildContext context) { showDialog(context: context, builder: (_) => "
+        "Text('x')); showModalBottomSheet(context: context, builder: (_) => Text('y')); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "material.showDialog"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "material.showModalBottomSheet"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_flutter_theme_media_query_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\n"
+        "double run(BuildContext context) { Theme.of(context).copyWith(); return "
+        "MediaQuery.of(context).size.width; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Theme.of"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "ThemeData.copyWith"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "MediaQuery.of"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Size.width"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_http_client_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:http/http.dart' as http;\n"
+        "Future<http.Response> run(Uri uri) => http.Client().get(uri);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "http.lib.http.Client"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "BaseClient.get"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_http_await_response_property) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:http/http.dart' as http;\n"
+        "Future<String> run(Uri uri) async { final response = await http.get(uri); "
+        "return response.body.trim(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "http.lib.http.get"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Response.body"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "String.trim"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_dio_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:dio/dio.dart';\nFuture<Response> run() => Dio().get('/users');\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "dio.lib.dio.Dio"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Dio.get"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_provider_and_change_notifier) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\nimport 'package:provider/provider.dart';\n"
+        "class Model extends ChangeNotifier { void update() { notifyListeners(); } }\n"
+        "Model run(BuildContext context) => Provider.of<Model>(context);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "update", "ChangeNotifier.notifyListeners"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "Provider.of"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_riverpod_ref_calls) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter_riverpod/flutter_riverpod.dart';\n"
+        "void run(WidgetRef ref, Object provider) { ref.watch(provider); ref.read(provider); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "WidgetRef.watch"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "WidgetRef.read"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_bloc_calls) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:flutter/material.dart';\nimport 'package:flutter_bloc/flutter_bloc.dart';\n"
+        "class Counter extends Cubit<int> { Counter() : super(0); void increment() { emit(1); } }\n"
+        "Counter run(BuildContext context) => BlocProvider.of<Counter>(context);\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "increment", "BlocBase.emit"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "BlocProvider.of"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_get_it_static_getter_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:get_it/get_it.dart';\nObject run() => GetIt.instance.get<Object>();\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "GetIt.instance"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "GetIt.get"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_shared_preferences_await_chain) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:shared_preferences/shared_preferences.dart';\n"
+        "Future<String> run() async { final prefs = await SharedPreferences.getInstance(); "
+        "prefs.setString('key', 'value'); return prefs.getString('key') ?? ''; }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(dart_require_resolved(r, "run", "SharedPreferences.getInstance"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "SharedPreferences.setString"), 0);
+    ASSERT_GTE(dart_require_resolved(r, "run", "SharedPreferences.getString"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_unimported_flutter_abstains) {
+    CBMFileResult *r = extract_dart_lsp("void run(dynamic context) { Navigator.of(context); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(dart_find_resolved(r, "run", "Navigator.of"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(dartlsp_hidden_package_symbol_abstains) {
+    CBMFileResult *r = extract_dart_lsp(
+        "import 'package:http/http.dart' hide Client;\nvoid run() { Client(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(dart_find_resolved(r, "run", "http.lib.http.Client"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(dart_lsp) {
     RUN_TEST(dartlsp_core_print);
     RUN_TEST(dartlsp_local_top_level_call);
@@ -971,4 +1246,29 @@ SUITE(dart_lsp) {
     RUN_TEST(dartlsp_relative_import_unprefixed_show);
     RUN_TEST(dartlsp_relative_import_derived_from_module);
     RUN_TEST(dartlsp_package_import_includes_lib_root);
+    RUN_TEST(dartlsp_stdlib_string_split_chain);
+    RUN_TEST(dartlsp_stdlib_list_map_to_list);
+    RUN_TEST(dartlsp_stdlib_iterable_generic_property_chain);
+    RUN_TEST(dartlsp_stdlib_json_functions);
+    RUN_TEST(dartlsp_stdlib_prefixed_json_functions);
+    RUN_TEST(dartlsp_stdlib_future_then_chain);
+    RUN_TEST(dartlsp_stdlib_io_file_chain);
+    RUN_TEST(dartlsp_stdlib_math_random);
+    RUN_TEST(dartlsp_stdlib_typed_data);
+    RUN_TEST(dartlsp_flutter_navigator_chain);
+    RUN_TEST(dartlsp_flutter_bare_set_state);
+    RUN_TEST(dartlsp_flutter_widget_constructors);
+    RUN_TEST(dartlsp_flutter_named_constructors_and_color);
+    RUN_TEST(dartlsp_flutter_dialog_functions);
+    RUN_TEST(dartlsp_flutter_theme_media_query_chain);
+    RUN_TEST(dartlsp_http_client_chain);
+    RUN_TEST(dartlsp_http_await_response_property);
+    RUN_TEST(dartlsp_dio_chain);
+    RUN_TEST(dartlsp_provider_and_change_notifier);
+    RUN_TEST(dartlsp_riverpod_ref_calls);
+    RUN_TEST(dartlsp_bloc_calls);
+    RUN_TEST(dartlsp_get_it_static_getter_chain);
+    RUN_TEST(dartlsp_shared_preferences_await_chain);
+    RUN_TEST(dartlsp_unimported_flutter_abstains);
+    RUN_TEST(dartlsp_hidden_package_symbol_abstains);
 }

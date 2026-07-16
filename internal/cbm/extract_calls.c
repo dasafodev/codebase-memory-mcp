@@ -1798,11 +1798,192 @@ static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const 
     return NULL;
 }
 
+/* --- Dart same-file path-constant resolution (endpoints classes) --- */
+
+/* True when s is a dotted identifier path like `_XxxEndpoints.field` (>=1 dot,
+ * only ident chars and dots). Bare locals (no dot) return false so they are
+ * left to the deferred local-variable pass. */
+static bool dart_is_dotted_ident(const char *s) {
+    if (!s || !s[0]) {
+        return false;
+    }
+    bool dot = false;
+    for (const char *p = s; *p; p++) {
+        char c = *p;
+        if (c == '.') {
+            dot = true;
+            continue;
+        }
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9') || c == '_')) {
+            return false;
+        }
+    }
+    return dot;
+}
+
+/* Resolve a Dart const string whose value may begin with an interpolation of
+ * another same-file const, e.g. "$base/x" or "${_E.base}/$id". Non-leading
+ * interpolations ($id) are left verbatim (the route matcher normalizes them).
+ * Returns an arena string, or NULL if a leading interpolation names an unknown
+ * const. `depth` guards const->const cycles. */
+static const char *dart_resolve_const_string(CBMExtractCtx *ctx, const char *content, int depth) {
+    if (!content) {
+        return NULL;
+    }
+    if (content[0] != '$') {
+        return content;
+    }
+    if (depth > 6) {
+        return NULL;
+    }
+    const char *p = content + 1;
+    if (*p == '{') {
+        const char *tok_start = p + 1;
+        const char *close = strchr(tok_start, '}');
+        if (!close) {
+            return NULL;
+        }
+        char *tok = cbm_arena_strndup(ctx->arena, tok_start, (size_t)(close - tok_start));
+        const char *raw = lookup_string_constant(ctx, tok);
+        if (!raw) {
+            const char *dot = strrchr(tok, '.');
+            if (dot && dot[1]) {
+                raw = lookup_string_constant(ctx, dot + 1);
+            }
+        }
+        if (!raw) {
+            return NULL;
+        }
+        const char *base = dart_resolve_const_string(ctx, raw, depth + 1);
+        if (!base) {
+            return NULL;
+        }
+        return cbm_arena_sprintf(ctx->arena, "%s%s", base, close + 1);
+    }
+    const char *q = p;
+    while (*q && ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') ||
+                  (*q >= '0' && *q <= '9') || *q == '_')) {
+        q++;
+    }
+    if (q == p) {
+        return NULL;
+    }
+    char *tok = cbm_arena_strndup(ctx->arena, p, (size_t)(q - p));
+    const char *raw = lookup_string_constant(ctx, tok);
+    if (!raw) {
+        return NULL;
+    }
+    const char *base = dart_resolve_const_string(ctx, raw, depth + 1);
+    if (!base) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s%s", base, q);
+}
+
+/* Dart: resolve the first positional arg when it references a same-file path
+ * constant — a member access (_E.foo) or a string beginning with an
+ * interpolation of one (${_E.base}/...). Returns a path (arena) or NULL. */
+static const char *dart_resolve_endpoint_arg(CBMExtractCtx *ctx, TSNode arg) {
+    const char *ak = ts_node_type(arg);
+    TSNode inner = arg;
+    if (strcmp(ak, "argument") == 0 && ts_node_named_child_count(arg) > 0) {
+        inner = ts_node_named_child(arg, 0);
+        ak = ts_node_type(inner);
+    }
+    if (is_string_like(ak)) {
+        char *text = cbm_node_text(ctx->arena, inner, ctx->source);
+        const char *content = strip_and_validate_string_arg(ctx->arena, text);
+        if (content && content[0] == '$') {
+            const char *r = dart_resolve_const_string(ctx, content, 0);
+            if (r && r[0] == '/') {
+                return r;
+            }
+        }
+        return NULL;
+    }
+    if (strcmp(ak, "identifier") == 0) {
+        /* The whole `argument` node text is the dotted key (_E.foo). */
+        char *full = cbm_node_text(ctx->arena, arg, ctx->source);
+        if (dart_is_dotted_ident(full)) {
+            const char *raw = lookup_string_constant(ctx, full);
+            if (!raw) {
+                const char *dot = strrchr(full, '.');
+                if (dot && dot[1]) {
+                    raw = lookup_string_constant(ctx, dot + 1);
+                }
+            }
+            if (raw) {
+                const char *r = dart_resolve_const_string(ctx, raw, 0);
+                if (r && r[0] == '/') {
+                    return r;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
+/* Dart: recover the callee for a wrapper HTTP client call whose route is a
+ * same-file endpoint constant rather than an inline literal
+ * (apiClient.get(_E.foo, ...) or apiClient.get('${_E.base}/$id')). Returns the
+ * dotted `receiver.verb` callee only when the first arg resolves to a `/path`,
+ * so ordinary Dart `.get()` calls (list.get(0)) never fabricate a callee.
+ * extract_dart_callee already handles the inline-literal form. */
+static char *dart_wrapper_http_callee(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(cbm_find_child_by_kind(node, "argument_part"))) {
+        return NULL;
+    }
+    TSNode msel = ts_node_prev_named_sibling(node);
+    if (ts_node_is_null(msel) || strcmp(ts_node_type(msel), "selector") != 0) {
+        return NULL;
+    }
+    TSNode recv = ts_node_prev_named_sibling(msel);
+    if (ts_node_is_null(recv) || strcmp(ts_node_type(recv), "identifier") != 0) {
+        return NULL;
+    }
+    TSNode asel = cbm_find_child_by_kind(msel, "unconditional_assignable_selector");
+    if (ts_node_is_null(asel)) {
+        asel = cbm_find_child_by_kind(msel, "conditional_assignable_selector");
+    }
+    TSNode mid = ts_node_is_null(asel) ? (TSNode){0} : cbm_find_child_by_kind(asel, "identifier");
+    if (ts_node_is_null(mid)) {
+        return NULL;
+    }
+    char *method = cbm_node_text(ctx->arena, mid, ctx->source);
+    if (!method || !dart_is_http_verb(method)) {
+        return NULL;
+    }
+    TSNode argpart = cbm_find_child_by_kind(node, "argument_part");
+    TSNode args = cbm_find_child_by_kind(argpart, "arguments");
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return NULL;
+    }
+    const char *resolved = dart_resolve_endpoint_arg(ctx, ts_node_named_child(args, 0));
+    if (!resolved || resolved[0] != '/') {
+        return NULL;
+    }
+    char *rname = cbm_node_text(ctx->arena, recv, ctx->source);
+    if (!rname || !rname[0]) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s.%s", rname, method);
+}
+
 // Extract URL/topic from keyword or positional args.
 static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
     uint32_t nc = ts_node_named_child_count(args);
     for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
+        /* Dart: resolve same-file endpoint constants before the generic unwrap
+         * (which drops the `.field` selector of a member access). Inline string
+         * literals fall through to the generic path below. */
+        if (ctx->language == CBM_LANG_DART) {
+            const char *dv = dart_resolve_endpoint_arg(ctx, arg);
+            if (dv) {
+                return dv;
+            }
+        }
         /* PHP and C# wrap each positional argument in an `argument` node;
          * unwrap to the underlying value so the URL string is reachable. */
         if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
@@ -2249,6 +2430,16 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
                     }
                 }
             }
+        }
+
+        // Dart: wrapper HTTP client call whose route is a same-file endpoint
+        // constant (apiClient.get(_E.foo) / apiClient.get('${_E.base}/$id')).
+        // The route is not an inline literal, so extract_dart_callee dropped the
+        // callee; recover `receiver.verb` here (ctx exposes the const table) so
+        // the HTTP_CALLS edge can form, matching the inline-literal path.
+        if (!callee && ctx->language == CBM_LANG_DART &&
+            strcmp(ts_node_type(node), "selector") == 0) {
+            callee = dart_wrapper_http_callee(ctx, node);
         }
 
         // ObjectScript: expand a $$$Macro callee via the macro table.

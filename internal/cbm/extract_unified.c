@@ -775,6 +775,79 @@ static void handle_string_constants(CBMExtractCtx *ctx, TSNode node, const WalkS
     }
 }
 
+/* --- Dart same-file path-constant collection (endpoints classes) ---
+ * wagon-style datasources reference API paths as `static const String x = '/p'`
+ * inside a private `_XxxEndpoints` class, then call `apiClient.get(_X.x, ...)`.
+ * The path is never an inline literal at the call site, so pre-collect these
+ * constants (keyed by bare name AND ClassName.name) into the same
+ * string-constant map used by the call resolver. Composed values
+ * (`static const y = '$x/sub'`) are stored raw and resolved lazily by the
+ * call-side resolver. */
+static const char *dart_enclosing_class_name(CBMExtractCtx *ctx, TSNode node) {
+    TSNode p = ts_node_parent(node);
+    int guard = 0;
+    while (!ts_node_is_null(p) && guard++ < 16) {
+        if (strcmp(ts_node_type(p), "class_definition") == 0) {
+            TSNode nm = ts_node_child_by_field_name(p, TS_FIELD("name"));
+            if (!ts_node_is_null(nm)) {
+                return cbm_node_text(ctx->arena, nm, ctx->source);
+            }
+            return NULL;
+        }
+        p = ts_node_parent(p);
+    }
+    return NULL;
+}
+
+static void dart_prescan_consts(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "static_final_declaration") == 0) {
+        TSNode name_n = ts_node_named_child(node, 0);
+        if (!ts_node_is_null(name_n) && strcmp(ts_node_type(name_n), "identifier") == 0) {
+            TSNode val_n = {0};
+            bool have_val = false;
+            uint32_t vcc = ts_node_named_child_count(node);
+            for (uint32_t i = 1; i < vcc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                if (is_string_node(ts_node_type(c))) {
+                    val_n = c;
+                    have_val = true;
+                    break;
+                }
+            }
+            if (have_val) {
+                char *name = cbm_node_text(ctx->arena, name_n, ctx->source);
+                char *value = cbm_node_text(ctx->arena, val_n, ctx->source);
+                if (name && name[0] && value && value[0]) {
+                    int vlen = (int)strlen(value);
+                    if (vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
+                        value = cbm_arena_strndup(ctx->arena, value + SKIP_ONE,
+                                                  (size_t)(vlen - PAIR_LEN));
+                    }
+                    if (value && value[0]) {
+                        CBMStringConstantMap *map = &ctx->string_constants;
+                        if (map->count < CBM_MAX_STRING_CONSTANTS) {
+                            map->names[map->count] = name;
+                            map->values[map->count] = value;
+                            map->count++;
+                        }
+                        const char *cls = dart_enclosing_class_name(ctx, node);
+                        if (cls && cls[0] && map->count < CBM_MAX_STRING_CONSTANTS) {
+                            map->names[map->count] =
+                                cbm_arena_sprintf(ctx->arena, "%s.%s", cls, name);
+                            map->values[map->count] = value;
+                            map->count++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        dart_prescan_consts(ctx, ts_node_child(node, i));
+    }
+}
+
 // --- String literal collection ---
 
 static bool is_string_node(const char *kind) {
@@ -1469,6 +1542,13 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
         return;
+    }
+
+    /* Dart: pre-collect same-file `_XxxEndpoints` path constants so the call
+     * resolver can turn `apiClient.get(_X.foo, ...)` into an HTTP_CALLS edge
+     * regardless of where the constant class sits relative to its uses. */
+    if (ctx->language == CBM_LANG_DART) {
+        dart_prescan_consts(ctx, ctx->root);
     }
 
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);

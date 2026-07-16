@@ -633,8 +633,84 @@ static char *extract_wgsl_callee(CBMArena *a, TSNode node, const char *source, c
 
 // Dart: the invocation `selector` (the `(...)` part) follows the callee
 // identifier as a sibling; `new_expression`'s first named child is the type.
+static bool dart_is_http_verb(const char *m) {
+    return m && (strcmp(m, "get") == 0 || strcmp(m, "post") == 0 || strcmp(m, "put") == 0 ||
+                 strcmp(m, "patch") == 0 || strcmp(m, "delete") == 0 || strcmp(m, "head") == 0);
+}
+
+/* True when the argument-bearing `selector`'s first string arg looks like an
+ * HTTP route (`/path` or `scheme://...`). Used to recognize wrapper client
+ * calls (`apiClient.get('/x')`) whose receiver is not a known client library. */
+static bool dart_argpart_has_route_literal(CBMArena *a, TSNode selector, const char *source) {
+    TSNode argpart = cbm_find_child_by_kind(selector, "argument_part");
+    if (ts_node_is_null(argpart)) {
+        return false;
+    }
+    TSNode args = cbm_find_child_by_kind(argpart, "arguments");
+    if (ts_node_is_null(args)) {
+        return false;
+    }
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
+            arg = ts_node_named_child(arg, 0);
+        }
+        if (strcmp(ts_node_type(arg), "string_literal") == 0) {
+            char *txt = cbm_node_text(a, arg, source);
+            if (!txt) {
+                return false;
+            }
+            const char *s = txt;
+            if (s[0] == '"' || s[0] == '\'' || s[0] == '`') {
+                s++;
+            }
+            return s[0] == '/' || strstr(s, "://") != NULL;
+        }
+    }
+    return false;
+}
+
 static char *extract_dart_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
     if (strcmp(nk, "selector") == 0) {
+        /* Dart HTTP client call. A method-call site parses as sibling selectors:
+         *   identifier(dio)  selector(.get)  selector(argument_part(...)).
+         * tree-sitter-dart has no method-invocation node and no `arguments`
+         * field, so the arg-bearing selector's callee is otherwise dropped and
+         * `dio.get('/x')` never forms an HTTP_CALLS edge. When the receiver is a
+         * known HTTP/async client library, synthesize a dotted `receiver.method`
+         * callee so cbm_service_pattern_match sees the library id ("dio") and the
+         * route literal is emitted. Gated on the receiver being a known client so
+         * the rest of the Dart call graph is byte-identical. */
+        if (!ts_node_is_null(cbm_find_child_by_kind(node, "argument_part"))) {
+            TSNode msel = ts_node_prev_named_sibling(node);
+            if (!ts_node_is_null(msel) && strcmp(ts_node_type(msel), "selector") == 0) {
+                TSNode recv = ts_node_prev_named_sibling(msel);
+                if (!ts_node_is_null(recv) && strcmp(ts_node_type(recv), "identifier") == 0) {
+                    char *rname = cbm_node_text(a, recv, source);
+                    cbm_svc_kind_t rk = rname ? cbm_service_pattern_match(rname) : CBM_SVC_NONE;
+                    bool known_client = (rk == CBM_SVC_HTTP || rk == CBM_SVC_ASYNC);
+                    TSNode asel = cbm_find_child_by_kind(msel, "unconditional_assignable_selector");
+                    if (ts_node_is_null(asel)) {
+                        asel = cbm_find_child_by_kind(msel, "conditional_assignable_selector");
+                    }
+                    TSNode mid = ts_node_is_null(asel) ? (TSNode){0}
+                                                       : cbm_find_child_by_kind(asel, "identifier");
+                    if (!ts_node_is_null(mid)) {
+                        char *method = cbm_node_text(a, mid, source);
+                        /* Emit the dotted `receiver.method` callee for a known client
+                         * (dio) OR a wrapper HTTP call — an HTTP-verb method with a
+                         * route-literal first arg (`apiClient.get('/x')`). The route
+                         * literal keeps ordinary Dart method calls (list.get(0)) out. */
+                        bool wrapper_http = method && dart_is_http_verb(method) &&
+                                            dart_argpart_has_route_literal(a, node, source);
+                        if (method && method[0] && (known_client || wrapper_http)) {
+                            return cbm_arena_sprintf(a, "%s.%s", rname, method);
+                        }
+                    }
+                }
+            }
+        }
         TSNode prev = ts_node_prev_named_sibling(node);
         if (!ts_node_is_null(prev) && strcmp(ts_node_type(prev), "identifier") == 0) {
             return cbm_node_text(a, prev, source);
@@ -2235,6 +2311,16 @@ void handle_calls(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Walk
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            // Dart has no `arguments` FIELD; a call-site `selector` holds the
+            // args in `argument_part > arguments`. Reach them by kind so HTTP
+            // client calls (dio.get('/x')) can extract the route literal.
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_DART &&
+                strcmp(ts_node_type(node), "selector") == 0) {
+                TSNode argpart = cbm_find_child_by_kind(node, "argument_part");
+                if (!ts_node_is_null(argpart)) {
+                    args = cbm_find_child_by_kind(argpart, "arguments");
+                }
+            }
             // ObjectScript stores args under oref_method/method_args, not the
             // generic "arguments" field.
             if (ts_node_is_null(args) && (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||

@@ -2361,6 +2361,22 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             }
         }
 
+        /* Dart/Flutter is HTTP-client-only: a dotted verb-suffixed call with a
+         * route-literal first arg (`apiClient.get('/x')` wrapper around Dio/http,
+         * receiver not a known client lib) is a client call, not a route
+         * registration. Emit HTTP_CALLS; the callee_suffix branch below would
+         * otherwise mint a phantom server Route in the Flutter graph. */
+        if (lang == CBM_LANG_DART && call->first_string_arg && call->first_string_arg[0] == '/' &&
+            strchr(call->callee_name, '.') != NULL &&
+            cbm_service_pattern_route_method(call->callee_name) != NULL) {
+            cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
+                                         .confidence = PP_HALF_CONF,
+                                         .strategy = "service_pattern"};
+            emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &fake_res,
+                                         CBM_SVC_HTTP, call->first_string_arg);
+            continue;
+        }
+
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,

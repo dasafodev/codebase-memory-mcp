@@ -509,6 +509,22 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
+    /* Dart/Flutter is HTTP-client-only (no server routes): a dotted verb-suffixed
+     * call with a route-literal first arg (`apiClient.get('/x')`, a wrapper around
+     * Dio/http whose receiver is not a known client library) is a client call, not
+     * a route registration. Classify it as HTTP_CALLS here so the empty-resolution
+     * branch below does not mint a phantom server Route in the Flutter graph. */
+    if (lang == CBM_LANG_DART && call->first_string_arg && call->first_string_arg[0] == '/' &&
+        strchr(call->callee_name, '.') != NULL &&
+        cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                    .confidence = PC_SVC_PATTERN_CONF,
+                                    .strategy = "service_pattern",
+                                    .candidate_count = 0};
+        emit_http_async_edge(ctx, call, source_node, NULL, &svc_res, CBM_SVC_HTTP, false);
+        return SKIP_ONE;
+    }
+
     cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
                                                 imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {

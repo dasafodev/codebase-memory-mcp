@@ -1799,6 +1799,188 @@ static const char *spring_class_route_prefix(CBMArena *a, TSNode class_node, con
     return NULL;
 }
 
+/* ── NestJS route extraction (TypeScript decorators) ──────────────
+ * NestJS controllers use `@Controller('prefix')` on the class and
+ * `@Get('rel')`/`@Post()`/... on methods. Unlike Spring, the decorator
+ * invocation is a `call_expression` (not `call`) and method paths are usually
+ * relative segments (`:id`, `upcoming`) or absent, so the generic decorator
+ * route extractor misses them entirely. These helpers compose the full
+ * `/prefix/rel` path and verb; push_method_def sets route_path/route_method so
+ * the route-nodes pass (ensure_one_decorator_route) mints the Route+HANDLES. */
+static const char *nest_http_verb(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    if (strcmp(name, "Get") == 0) {
+        return "GET";
+    }
+    if (strcmp(name, "Post") == 0) {
+        return "POST";
+    }
+    if (strcmp(name, "Put") == 0) {
+        return "PUT";
+    }
+    if (strcmp(name, "Patch") == 0) {
+        return "PATCH";
+    }
+    if (strcmp(name, "Delete") == 0) {
+        return "DELETE";
+    }
+    if (strcmp(name, "All") == 0) {
+        return "ANY";
+    }
+    return NULL;
+}
+
+/* Callee identifier of a `decorator`'s call_expression (e.g. "Controller",
+ * "Get"); NULL when the decorator is not a call. Sets *out_call to the
+ * call_expression node when non-NULL. */
+static const char *nest_decorator_call_id(CBMArena *a, TSNode decorator, const char *source,
+                                          TSNode *out_call) {
+    TSNode call = cbm_find_child_by_kind(decorator, "call_expression");
+    if (ts_node_is_null(call)) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        fn = ts_node_named_child(call, 0);
+    }
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0) {
+        return NULL;
+    }
+    if (out_call) {
+        *out_call = call;
+    }
+    return cbm_node_text(a, fn, source);
+}
+
+/* First string argument of a call_expression, unquoted (via string_fragment).
+ * Returns "" for an empty-string arg, NULL when there is no string arg. */
+static const char *nest_call_first_string(CBMArena *a, TSNode call, const char *source) {
+    TSNode args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        args = cbm_find_child_by_kind(call, "arguments");
+    }
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(args);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode arg = ts_node_named_child(args, i);
+        if (strcmp(ts_node_type(arg), "string") == 0) {
+            TSNode frag = cbm_find_child_by_kind(arg, "string_fragment");
+            return ts_node_is_null(frag) ? "" : cbm_node_text(a, frag, source);
+        }
+    }
+    return NULL;
+}
+
+/* Controller prefix from a class node's `@Controller(...)` decorator (a
+ * prev-sibling of the class node). Returns the prefix ("" for @Controller()),
+ * or NULL when the class is not a NestJS controller. */
+static const char *nest_controller_prefix(CBMArena *a, TSNode class_node, const char *source) {
+    /* prev_NAMED_sibling: skip the anonymous `export` token between the
+     * @Controller decorator and the class in `@Controller('x') export class`. */
+    TSNode prev = ts_node_prev_named_sibling(class_node);
+    while (!ts_node_is_null(prev)) {
+        const char *pk = ts_node_type(prev);
+        if (strcmp(pk, "decorator") == 0) {
+            TSNode call = {0};
+            const char *id = nest_decorator_call_id(a, prev, source, &call);
+            if (id && strcmp(id, "Controller") == 0) {
+                const char *p = nest_call_first_string(a, call, source);
+                return p ? p : "";
+            }
+        } else if (strcmp(pk, "comment") != 0) {
+            break;
+        }
+        prev = ts_node_prev_named_sibling(prev);
+    }
+    return NULL;
+}
+
+/* HTTP verb + relative path from a method node's route decorator (a
+ * prev-sibling). Returns true and sets out_verb and out_rel on a match. */
+static bool nest_method_route(CBMArena *a, TSNode method_node, const char *source,
+                              const char **out_verb, const char **out_rel) {
+    TSNode prev = ts_node_prev_named_sibling(method_node);
+    while (!ts_node_is_null(prev)) {
+        const char *pk = ts_node_type(prev);
+        if (strcmp(pk, "decorator") == 0) {
+            TSNode call = {0};
+            const char *id = nest_decorator_call_id(a, prev, source, &call);
+            const char *verb = nest_http_verb(id);
+            if (verb) {
+                const char *rel = nest_call_first_string(a, call, source);
+                *out_verb = verb;
+                *out_rel = rel ? rel : "";
+                return true;
+            }
+        } else if (strcmp(pk, "comment") != 0) {
+            break;
+        }
+        prev = ts_node_prev_named_sibling(prev);
+    }
+    return false;
+}
+
+/* Compose `/prefix/rel`, tolerating empty parts and leading/trailing slashes. */
+static const char *nest_compose_route(CBMArena *a, const char *prefix, const char *rel) {
+    const char *p = prefix ? prefix : "";
+    const char *r = rel ? rel : "";
+    while (*p == '/') {
+        p++;
+    }
+    while (*r == '/') {
+        r++;
+    }
+    size_t plen = strlen(p);
+    while (plen > 0 && p[plen - 1] == '/') {
+        plen--;
+    }
+    size_t rlen = strlen(r);
+    while (rlen > 0 && r[rlen - 1] == '/') {
+        rlen--;
+    }
+    char *pc = cbm_arena_strndup(a, p, plen);
+    char *rc = cbm_arena_strndup(a, r, rlen);
+    if (pc[0] && rc[0]) {
+        return cbm_arena_sprintf(a, "/%s/%s", pc, rc);
+    }
+    if (pc[0]) {
+        return cbm_arena_sprintf(a, "/%s", pc);
+    }
+    if (rc[0]) {
+        return cbm_arena_sprintf(a, "/%s", rc);
+    }
+    return "/";
+}
+
+/* If method_node is a NestJS route handler (`@Get`/`@Post`/... inside a
+ * @Controller class), set def->route_path/route_method to the composed
+ * `/prefix/rel`. Walks up to the enclosing class to read the @Controller prefix,
+ * so it works from the main def-walk (extract_func_def sees only the method). */
+static void nest_apply_method_route(CBMArena *a, TSNode method_node, const char *source,
+                                    CBMDefinition *def) {
+    const char *verb = NULL;
+    const char *rel = NULL;
+    if (!nest_method_route(a, method_node, source, &verb, &rel)) {
+        return;
+    }
+    for (TSNode cur = ts_node_parent(method_node); !ts_node_is_null(cur);
+         cur = ts_node_parent(cur)) {
+        const char *ck = ts_node_type(cur);
+        if (strcmp(ck, "class_declaration") == 0 || strcmp(ck, "abstract_class_declaration") == 0) {
+            const char *cprefix = nest_controller_prefix(a, cur, source);
+            if (cprefix) {
+                def->route_method = verb;
+                def->route_path = nest_compose_route(a, cprefix, rel);
+            }
+            return;
+        }
+    }
+}
+
 // Extract decorator names from preceding decorator/annotation nodes
 // Count annotations inside a Java/Kotlin/C# "modifiers" node.
 static int count_modifier_annotations(TSNode modifiers, const CBMLangSpec *spec) {
@@ -3336,6 +3518,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+    /* NestJS controllers: method_definition is in ts_func_types, so route
+     * handlers reach the graph through here (not push_method_def). Compose the
+     * @Controller prefix + @Get/@Post relative path. */
+    if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) {
+        nest_apply_method_route(a, node, ctx->source, &def);
+    }
 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
@@ -4298,6 +4486,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
+    } else if (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX) {
+        /* NestJS: @Controller('prefix') class + @Get/@Post/... methods. (Most TS
+         * methods reach the graph via extract_func_def, but arrow-function class
+         * fields land here — keep both in sync so the QN upsert never clears a
+         * route_path set by the other path.) */
+        nest_apply_method_route(a, child, ctx->source, &def);
     }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 

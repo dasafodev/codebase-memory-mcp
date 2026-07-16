@@ -12,6 +12,7 @@
 #include "lsp/cs_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/dart_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
 #include "foundation/compat.h"
@@ -1173,6 +1174,9 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     }
     if (language == CBM_LANG_KOTLIN) {
         cbm_run_kotlin_lsp(a, result, source, source_len, root);
+    }
+    if (language == CBM_LANG_DART) {
+        cbm_run_dart_lsp(a, result, source, source_len, root);
     }
     if (language == CBM_LANG_RUST) {
         cbm_run_rust_lsp(a, result, source, source_len, root);

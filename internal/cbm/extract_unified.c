@@ -799,45 +799,68 @@ static const char *dart_enclosing_class_name(CBMExtractCtx *ctx, TSNode node) {
     return NULL;
 }
 
+/* Store a Dart same-file string constant under both its bare name and
+ * `EnclosingClass.name`, dequoting the string_literal value. Interpolated
+ * values (`'$base/x'`) are stored raw and resolved lazily by the call-side
+ * resolver. `owner` is the node whose enclosing class supplies the prefix. */
+static void dart_store_string_const(CBMExtractCtx *ctx, char *name, TSNode strlit,
+                                    TSNode owner) {
+    char *value = cbm_node_text(ctx->arena, strlit, ctx->source);
+    if (!name || !name[0] || !value || !value[0]) {
+        return;
+    }
+    int vlen = (int)strlen(value);
+    if (vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
+        value = cbm_arena_strndup(ctx->arena, value + SKIP_ONE, (size_t)(vlen - PAIR_LEN));
+    }
+    if (!value || !value[0]) {
+        return;
+    }
+    CBMStringConstantMap *map = &ctx->string_constants;
+    if (map->count < CBM_MAX_STRING_CONSTANTS) {
+        map->names[map->count] = name;
+        map->values[map->count] = value;
+        map->count++;
+    }
+    const char *cls = dart_enclosing_class_name(ctx, owner);
+    if (cls && cls[0] && map->count < CBM_MAX_STRING_CONSTANTS) {
+        map->names[map->count] = cbm_arena_sprintf(ctx->arena, "%s.%s", cls, name);
+        map->values[map->count] = value;
+        map->count++;
+    }
+}
+
 static void dart_prescan_consts(CBMExtractCtx *ctx, TSNode node) {
-    if (strcmp(ts_node_type(node), "static_final_declaration") == 0) {
+    const char *nk = ts_node_type(node);
+    /* `static const String x = '/p'` / `static const y = '$x/sub'`. */
+    if (strcmp(nk, "static_final_declaration") == 0) {
         TSNode name_n = ts_node_named_child(node, 0);
         if (!ts_node_is_null(name_n) && strcmp(ts_node_type(name_n), "identifier") == 0) {
-            TSNode val_n = {0};
-            bool have_val = false;
             uint32_t vcc = ts_node_named_child_count(node);
             for (uint32_t i = 1; i < vcc; i++) {
                 TSNode c = ts_node_named_child(node, i);
                 if (is_string_node(ts_node_type(c))) {
-                    val_n = c;
-                    have_val = true;
+                    dart_store_string_const(ctx, cbm_node_text(ctx->arena, name_n, ctx->source),
+                                            c, node);
                     break;
                 }
             }
-            if (have_val) {
-                char *name = cbm_node_text(ctx->arena, name_n, ctx->source);
-                char *value = cbm_node_text(ctx->arena, val_n, ctx->source);
-                if (name && name[0] && value && value[0]) {
-                    int vlen = (int)strlen(value);
-                    if (vlen >= CBM_QUOTE_PAIR && (value[0] == '"' || value[0] == '\'')) {
-                        value = cbm_arena_strndup(ctx->arena, value + SKIP_ONE,
-                                                  (size_t)(vlen - PAIR_LEN));
-                    }
-                    if (value && value[0]) {
-                        CBMStringConstantMap *map = &ctx->string_constants;
-                        if (map->count < CBM_MAX_STRING_CONSTANTS) {
-                            map->names[map->count] = name;
-                            map->values[map->count] = value;
-                            map->count++;
-                        }
-                        const char *cls = dart_enclosing_class_name(ctx, node);
-                        if (cls && cls[0] && map->count < CBM_MAX_STRING_CONSTANTS) {
-                            map->names[map->count] =
-                                cbm_arena_sprintf(ctx->arena, "%s.%s", cls, name);
-                            map->values[map->count] = value;
-                            map->count++;
-                        }
-                    }
+        }
+    }
+    /* Expression-bodied getter returning a literal: `String get endpoint => '/x'`.
+     * Datasources expose the base path this way and call `apiClient.get(endpoint)`. */
+    if (strcmp(nk, "method_signature") == 0) {
+        TSNode gs = cbm_find_child_by_kind(node, "getter_signature");
+        if (!ts_node_is_null(gs)) {
+            TSNode nm = ts_node_child_by_field_name(gs, TS_FIELD("name"));
+            TSNode body = ts_node_next_named_sibling(node);
+            if (!ts_node_is_null(nm) && !ts_node_is_null(body) &&
+                strcmp(ts_node_type(body), "function_body") == 0 &&
+                ts_node_named_child_count(body) > 0) {
+                TSNode bexpr = ts_node_named_child(body, 0);
+                if (is_string_node(ts_node_type(bexpr))) {
+                    dart_store_string_const(ctx, cbm_node_text(ctx->arena, nm, ctx->source),
+                                            bexpr, node);
                 }
             }
         }

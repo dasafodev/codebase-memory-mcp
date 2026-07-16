@@ -1881,15 +1881,166 @@ static const char *dart_resolve_const_string(CBMExtractCtx *ctx, const char *con
     return cbm_arena_sprintf(ctx->arena, "%s%s", base, q);
 }
 
-/* Dart: resolve the first positional arg when it references a same-file path
- * constant — a member access (_E.foo) or a string beginning with an
- * interpolation of one (${_E.base}/...). Returns a path (arena) or NULL. */
+/* Reduce a Dart endpoint expression to its underlying const/local key by
+ * dropping any trailing method-call transform (`.replaceAll(':id', x)`,
+ * `.replace(...)`, ...). `_E.x.replaceAll(':id', y)` -> `_E.x`; the const/local
+ * that supplies the route is what precedes the first call. Bare refs and plain
+ * member access (no parens) pass through unchanged. */
+static char *dart_strip_transforms(CBMExtractCtx *ctx, const char *expr) {
+    if (!expr) {
+        return NULL;
+    }
+    while (*expr == ' ' || *expr == '\t' || *expr == '\n' || *expr == '\r') {
+        expr++;
+    }
+    const char *paren = strchr(expr, '(');
+    size_t len = paren ? (size_t)(paren - expr) : strlen(expr);
+    if (paren) {
+        /* trim whitespace between the receiver and the call */
+        while (len > 0 && (expr[len - 1] == ' ' || expr[len - 1] == '\t' ||
+                           expr[len - 1] == '\n' || expr[len - 1] == '\r')) {
+            len--;
+        }
+        /* drop the `.method` selector that owns the parens */
+        size_t i = len;
+        while (i > 0 && expr[i - 1] != '.') {
+            i--;
+        }
+        if (i > 0) {
+            len = i - 1;
+        }
+    }
+    while (len > 0 && (expr[len - 1] == ' ' || expr[len - 1] == '\t' ||
+                       expr[len - 1] == '\n' || expr[len - 1] == '\r')) {
+        len--;
+    }
+    char *out = cbm_arena_strndup(ctx->arena, expr, len);
+    return (out && out[0]) ? out : NULL;
+}
+
+/* Look up a bare or dotted key in the same-file constant table and resolve any
+ * leading interpolation. Returns a `/path` (arena) or NULL. */
+static const char *dart_lookup_and_resolve(CBMExtractCtx *ctx, const char *key) {
+    if (!key || !key[0]) {
+        return NULL;
+    }
+    const char *raw = lookup_string_constant(ctx, key);
+    if (!raw) {
+        const char *dot = strrchr(key, '.');
+        if (dot && dot[1]) {
+            raw = lookup_string_constant(ctx, dot + 1);
+        }
+    }
+    if (!raw) {
+        return NULL;
+    }
+    const char *r = dart_resolve_const_string(ctx, raw, 0);
+    return (r && r[0] == '/') ? r : NULL;
+}
+
+/* Resolve a Dart local-variable initializer's source text to a `/path`: a
+ * string literal (`'/x'` / `'$base/x'`), a const reference (`_E.foo`), or such
+ * a reference with a trailing transform (`_E.foo.replaceAll(':id', y)`). */
+static const char *dart_resolve_value_text(CBMExtractCtx *ctx, const char *text) {
+    if (!text) {
+        return NULL;
+    }
+    while (*text == ' ' || *text == '\t' || *text == '\n' || *text == '\r') {
+        text++;
+    }
+    if (text[0] == '\'' || text[0] == '"') {
+        char *dup = cbm_arena_strdup(ctx->arena, text);
+        const char *content = strip_and_validate_string_arg(ctx->arena, dup);
+        if (content) {
+            if (content[0] == '/') {
+                return content;
+            }
+            if (content[0] == '$') {
+                const char *r = dart_resolve_const_string(ctx, content, 0);
+                if (r && r[0] == '/') {
+                    return r;
+                }
+            }
+        }
+        return NULL;
+    }
+    return dart_lookup_and_resolve(ctx, dart_strip_transforms(ctx, text));
+}
+
+/* Depth-first search for `final <name> = ...` within a function body subtree. */
+static TSNode dart_find_local_def(CBMExtractCtx *ctx, TSNode node, const char *name) {
+    if (strcmp(ts_node_type(node), "initialized_variable_definition") == 0) {
+        TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("name"));
+        if (!ts_node_is_null(nm)) {
+            char *n = cbm_node_text(ctx->arena, nm, ctx->source);
+            if (n && strcmp(n, name) == 0) {
+                return node;
+            }
+        }
+    }
+    uint32_t cc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < cc; i++) {
+        TSNode hit = dart_find_local_def(ctx, ts_node_child(node, i), name);
+        if (!ts_node_is_null(hit)) {
+            return hit;
+        }
+    }
+    return (TSNode){0};
+}
+
+/* Resolve a bare identifier used as an endpoint to a `/path` by finding its
+ * `final <name> = <expr>` declaration in the enclosing function body. Scoped to
+ * that function so distinct methods may reuse the same local name (e.g. two
+ * `final endpoint = _E.x.replaceAll(...)` that build different routes). */
+static const char *dart_resolve_local_var(CBMExtractCtx *ctx, TSNode from, const char *name) {
+    TSNode fb = ts_node_parent(from);
+    int guard = 0;
+    while (!ts_node_is_null(fb) && guard++ < 48 &&
+           strcmp(ts_node_type(fb), "function_body") != 0) {
+        fb = ts_node_parent(fb);
+    }
+    if (ts_node_is_null(fb)) {
+        return NULL;
+    }
+    TSNode def = dart_find_local_def(ctx, fb, name);
+    if (ts_node_is_null(def)) {
+        return NULL;
+    }
+    TSNode nm = ts_node_child_by_field_name(def, TS_FIELD("name"));
+    if (ts_node_is_null(nm)) {
+        return NULL;
+    }
+    uint32_t s = ts_node_end_byte(nm);
+    uint32_t e = ts_node_end_byte(def);
+    if (e <= s) {
+        return NULL;
+    }
+    char *frag = cbm_arena_strndup(ctx->arena, ctx->source + s, (size_t)(e - s));
+    if (!frag) {
+        return NULL;
+    }
+    char *p = frag;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '=') {
+        p++;
+    }
+    return dart_resolve_value_text(ctx, p);
+}
+
+/* Dart: resolve the first positional arg to a same-file endpoint path. Handles
+ * inline interpolations (`'${_E.base}/$id'`), member access (`_E.foo`), a
+ * transform chain (`_E.foo.replaceAll(':id', x)`), a bare class member
+ * (`static const _basePath`, `String get endpoint => '/x'`), and a local
+ * variable (`final endpoint = ...`). Returns a path (arena) or NULL. */
 static const char *dart_resolve_endpoint_arg(CBMExtractCtx *ctx, TSNode arg) {
     const char *ak = ts_node_type(arg);
     TSNode inner = arg;
-    if (strcmp(ak, "argument") == 0 && ts_node_named_child_count(arg) > 0) {
-        inner = ts_node_named_child(arg, 0);
-        ak = ts_node_type(inner);
+    uint32_t argnc = 0;
+    if (strcmp(ak, "argument") == 0) {
+        argnc = ts_node_named_child_count(arg);
+        if (argnc > 0) {
+            inner = ts_node_named_child(arg, 0);
+            ak = ts_node_type(inner);
+        }
     }
     if (is_string_like(ak)) {
         char *text = cbm_node_text(ctx->arena, inner, ctx->source);
@@ -1902,23 +2053,28 @@ static const char *dart_resolve_endpoint_arg(CBMExtractCtx *ctx, TSNode arg) {
         }
         return NULL;
     }
-    if (strcmp(ak, "identifier") == 0) {
-        /* The whole `argument` node text is the dotted key (_E.foo). */
-        char *full = cbm_node_text(ctx->arena, arg, ctx->source);
-        if (dart_is_dotted_ident(full)) {
-            const char *raw = lookup_string_constant(ctx, full);
-            if (!raw) {
-                const char *dot = strrchr(full, '.');
-                if (dot && dot[1]) {
-                    raw = lookup_string_constant(ctx, dot + 1);
-                }
+    /* Bare identifier: a local var or a class member (field/getter). */
+    if (strcmp(ak, "identifier") == 0 && argnc <= 1) {
+        char *name = cbm_node_text(ctx->arena, inner, ctx->source);
+        if (name && name[0]) {
+            const char *lv = dart_resolve_local_var(ctx, arg, name);
+            if (lv && lv[0] == '/') {
+                return lv;
             }
-            if (raw) {
-                const char *r = dart_resolve_const_string(ctx, raw, 0);
-                if (r && r[0] == '/') {
-                    return r;
-                }
+            const char *r = dart_lookup_and_resolve(ctx, name);
+            if (r && r[0] == '/') {
+                return r;
             }
+        }
+        return NULL;
+    }
+    /* Member access / transform chain: `_E.foo` or `_E.x.replaceAll(':id', y)`. */
+    char *full = cbm_node_text(ctx->arena, arg, ctx->source);
+    char *key = dart_strip_transforms(ctx, full);
+    if (key && dart_is_dotted_ident(key)) {
+        const char *r = dart_lookup_and_resolve(ctx, key);
+        if (r && r[0] == '/') {
+            return r;
         }
     }
     return NULL;

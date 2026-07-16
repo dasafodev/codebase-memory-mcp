@@ -3,7 +3,7 @@
  *
  * The pass is intentionally small and conservative.  It resolves calls only
  * when a receiver or top-level declaration can be typed from the current
- * file, an import, or the inline dart:core seed.  Anything else is left for
+ * file, an import, or the curated Dart/Flutter registry seeds. Anything else is left for
  * the existing name-based resolver.
  */
 #ifndef CBM_LSP_DART_LSP_H
@@ -13,6 +13,10 @@
 #include "go_lsp.h" /* CBMLSPDef / CBMResolvedCallArray */
 #include "scope.h"
 #include "type_registry.h"
+
+/* Dart-only registry flags shared with the generated seed files. */
+#define CBM_DART_FUNC_FLAG_CONSTRUCTOR (1 << 20)
+#define CBM_DART_FUNC_FLAG_FACTORY (1 << 21)
 
 typedef struct {
     const char *uri;
@@ -81,5 +85,9 @@ const CBMType *dart_lookup_property_type(DartLSPContext *ctx, const char *class_
 
 void cbm_run_dart_lsp(CBMArena *arena, CBMFileResult *result, const char *source, int source_len,
                       TSNode root);
+
+void cbm_dart_stdlib_register(CBMTypeRegistry *registry, CBMArena *arena);
+const char *const *cbm_dart_default_import_packages(int *count_out);
+void cbm_dart_flutter_seed_register(CBMTypeRegistry *registry, CBMArena *arena);
 
 #endif /* CBM_LSP_DART_LSP_H */

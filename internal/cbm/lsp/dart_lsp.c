@@ -14,9 +14,6 @@
 #define DART_NAME_LIST_MAX 64
 #define TS_FIELD(name) name, (uint32_t)(sizeof(name) - 1)
 
-#define DART_FUNC_FLAG_CONSTRUCTOR (1 << 20)
-#define DART_FUNC_FLAG_FACTORY (1 << 21)
-
 #define DART_CONF_CONSTRUCTOR 0.95f
 #define DART_CONF_TOP_LEVEL 0.95f
 #define DART_CONF_METHOD 0.91f
@@ -153,9 +150,39 @@ static const CBMType *dart_return_type(const CBMRegisteredFunc *func) {
     return ret ? ret : cbm_type_unknown();
 }
 
+static const CBMType *dart_resolved_return_type(DartLSPContext *ctx,
+                                                const CBMType *receiver,
+                                                const CBMRegisteredFunc *func) {
+    const CBMType *result = dart_return_type(func);
+    if (!ctx || !receiver || receiver->kind != CBM_TYPE_TEMPLATE ||
+        !receiver->data.template_type.template_args) {
+        return result;
+    }
+    const char *receiver_qn = receiver->data.template_type.template_name;
+    const CBMRegisteredType *type =
+        receiver_qn ? cbm_registry_lookup_type(ctx->registry, receiver_qn) : NULL;
+    if (!type || !type->type_param_names) {
+        return result;
+    }
+    return cbm_type_substitute(ctx->arena, result, type->type_param_names,
+                               receiver->data.template_type.template_args);
+}
+
 static const CBMType *dart_signature(CBMArena *arena, const CBMType *return_type) {
     const CBMType *returns[2] = {return_type ? return_type : cbm_type_unknown(), NULL};
     return cbm_type_func(arena, NULL, NULL, returns);
+}
+
+static void dart_register_default_constructor(CBMTypeRegistry *registry, CBMArena *arena,
+                                              const char *class_qn) {
+    CBMRegisteredFunc func = {0};
+    func.receiver_type = class_qn;
+    func.short_name = "<init>";
+    func.qualified_name = class_qn;
+    func.signature = dart_signature(arena, cbm_type_named(arena, class_qn));
+    func.min_params = 0;
+    func.flags = CBM_FUNC_FLAG_STATICMETHOD | CBM_DART_FUNC_FLAG_CONSTRUCTOR;
+    cbm_registry_add_func(registry, func);
 }
 
 static void dart_emit(DartLSPContext *ctx, const char *callee_qn, const char *strategy,
@@ -174,143 +201,6 @@ static void dart_emit(DartLSPContext *ctx, const char *callee_qn, const char *st
         fprintf(stderr, "[dart_lsp] %s -> %s [%s %.2f]\n", ctx->enclosing_func_qn, callee_qn,
                 strategy, (double)confidence);
     }
-}
-
-static void dart_seed_type(CBMTypeRegistry *registry, CBMArena *arena, const char *qn,
-                           const char *parent) {
-    CBMRegisteredType type = {0};
-    type.qualified_name = qn;
-    type.short_name = dart_short(qn);
-    if (parent) {
-        const char **parents = (const char **)cbm_arena_alloc(arena, 2 * sizeof(const char *));
-        if (parents) {
-            parents[0] = parent;
-            parents[1] = NULL;
-            type.embedded_types = parents;
-        }
-    }
-    cbm_registry_add_type(registry, type);
-}
-
-static void dart_seed_method(CBMTypeRegistry *registry, CBMArena *arena, const char *receiver,
-                             const char *name, const CBMType *return_type, int flags) {
-    CBMRegisteredFunc func = {0};
-    func.receiver_type = receiver;
-    func.short_name = name;
-    func.qualified_name = dart_join(arena, receiver, name);
-    func.signature = dart_signature(arena, return_type);
-    func.min_params = 0;
-    func.flags = flags;
-    cbm_registry_add_func(registry, func);
-}
-
-static void dart_seed_function(CBMTypeRegistry *registry, CBMArena *arena, const char *name,
-                               const CBMType *return_type) {
-    CBMRegisteredFunc func = {0};
-    func.receiver_type = NULL;
-    func.short_name = name;
-    func.qualified_name = dart_join(arena, "dart.core", name);
-    func.signature = dart_signature(arena, return_type);
-    func.min_params = 0;
-    cbm_registry_add_func(registry, func);
-}
-
-static void dart_seed_constructor(CBMTypeRegistry *registry, CBMArena *arena, const char *type_qn,
-                                  bool is_factory) {
-    CBMRegisteredFunc func = {0};
-    func.receiver_type = type_qn;
-    func.short_name = "<init>";
-    func.qualified_name = type_qn;
-    func.signature = dart_signature(arena, cbm_type_named(arena, type_qn));
-    func.min_params = 0;
-    func.flags = CBM_FUNC_FLAG_STATICMETHOD | DART_FUNC_FLAG_CONSTRUCTOR;
-    if (is_factory) {
-        func.flags |= DART_FUNC_FLAG_FACTORY;
-    }
-    cbm_registry_add_func(registry, func);
-}
-
-static void dart_seed_core(CBMTypeRegistry *registry, CBMArena *arena) {
-    static const struct {
-        const char *qn;
-        const char *parent;
-    } types[] = {{"dart.core.Object", NULL},
-                 {"dart.core.String", "dart.core.Object"},
-                 {"dart.core.num", "dart.core.Object"},
-                 {"dart.core.int", "dart.core.num"},
-                 {"dart.core.double", "dart.core.num"},
-                 {"dart.core.bool", "dart.core.Object"},
-                 {"dart.core.List", "dart.core.Iterable"},
-                 {"dart.core.Map", "dart.core.Object"},
-                 {"dart.core.Set", "dart.core.Iterable"},
-                 {"dart.core.Iterable", "dart.core.Object"},
-                 {"dart.core.Iterator", "dart.core.Object"},
-                 {"dart.async.Future", "dart.core.Object"},
-                 {"dart.async.Stream", "dart.core.Object"},
-                 {"dart.core.Duration", "dart.core.Object"},
-                 {"dart.core.DateTime", "dart.core.Object"},
-                 {"dart.core.RegExp", "dart.core.Object"},
-                 {"dart.core.Null", "dart.core.Object"},
-                 {"dart.core.Never", "dart.core.Object"},
-                 {NULL, NULL}};
-    for (int i = 0; types[i].qn; i++) {
-        dart_seed_type(registry, arena, types[i].qn, types[i].parent);
-    }
-
-    const CBMType *object_t = cbm_type_named(arena, "dart.core.Object");
-    const CBMType *string_t = cbm_type_named(arena, "dart.core.String");
-    const CBMType *int_t = cbm_type_named(arena, "dart.core.int");
-    const CBMType *bool_t = cbm_type_named(arena, "dart.core.bool");
-    const CBMType *void_t = cbm_type_named(arena, "dart.core.void");
-    const CBMType *list_t = cbm_type_named(arena, "dart.core.List");
-    const CBMType *iterable_t = cbm_type_named(arena, "dart.core.Iterable");
-    const CBMType *iterator_t = cbm_type_named(arena, "dart.core.Iterator");
-    const CBMType *future_t = cbm_type_named(arena, "dart.async.Future");
-
-    dart_seed_method(registry, arena, "dart.core.Object", "toString", string_t, 0);
-    dart_seed_method(registry, arena, "dart.core.Object", "hashCode", int_t,
-                     CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.Object", "runtimeType", object_t,
-                     CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.String", "toUpperCase", string_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "toLowerCase", string_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "trim", string_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "substring", string_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "replaceAll", string_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "contains", bool_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "startsWith", bool_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "endsWith", bool_t, 0);
-    dart_seed_method(registry, arena, "dart.core.String", "length", int_t, CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.List", "add", void_t, 0);
-    dart_seed_method(registry, arena, "dart.core.List", "addAll", void_t, 0);
-    dart_seed_method(registry, arena, "dart.core.List", "map", iterable_t, 0);
-    dart_seed_method(registry, arena, "dart.core.List", "where", iterable_t, 0);
-    dart_seed_method(registry, arena, "dart.core.List", "length", int_t, CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.List", "first", object_t, CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.Iterable", "map", iterable_t, 0);
-    dart_seed_method(registry, arena, "dart.core.Iterable", "where", iterable_t, 0);
-    dart_seed_method(registry, arena, "dart.core.Iterable", "toList", list_t, 0);
-    dart_seed_method(registry, arena, "dart.core.Iterable", "iterator", iterator_t,
-                     CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.Map", "containsKey", bool_t, 0);
-    dart_seed_method(registry, arena, "dart.core.Map", "length", int_t, CBM_FUNC_FLAG_PROPERTY);
-    dart_seed_method(registry, arena, "dart.core.Set", "contains", bool_t, 0);
-    dart_seed_method(registry, arena, "dart.async.Future", "then", future_t, 0);
-    dart_seed_method(registry, arena, "dart.async.Stream", "listen", object_t, 0);
-    dart_seed_method(registry, arena, "dart.core.DateTime", "now",
-                     cbm_type_named(arena, "dart.core.DateTime"), CBM_FUNC_FLAG_STATICMETHOD);
-    dart_seed_method(registry, arena, "dart.core.RegExp", "hasMatch", bool_t, 0);
-
-    dart_seed_constructor(registry, arena, "dart.core.Object", false);
-    dart_seed_constructor(registry, arena, "dart.core.Map", true);
-    dart_seed_constructor(registry, arena, "dart.core.Set", true);
-    dart_seed_constructor(registry, arena, "dart.async.Future", false);
-    dart_seed_constructor(registry, arena, "dart.core.Duration", false);
-    dart_seed_constructor(registry, arena, "dart.core.DateTime", false);
-    dart_seed_constructor(registry, arena, "dart.core.RegExp", true);
-
-    dart_seed_function(registry, arena, "print", void_t);
-    dart_seed_function(registry, arena, "identical", bool_t);
 }
 
 void dart_lsp_init(DartLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
@@ -612,6 +502,23 @@ static bool dart_has_explicit_core_import(DartLSPContext *ctx) {
     return false;
 }
 
+static const char *dart_library_type_qn(DartLSPContext *ctx, const char *library,
+                                        const char *name) {
+    const char *qn = dart_join(ctx->arena, library, name);
+    if (cbm_registry_lookup_type(ctx->registry, qn)) {
+        return qn;
+    }
+    /* dart:core publicly exposes these dart:async declarations. */
+    if (strcmp(library, "dart.core") == 0 &&
+        (strcmp(name, "Future") == 0 || strcmp(name, "Stream") == 0)) {
+        qn = dart_join(ctx->arena, "dart.async", name);
+        if (cbm_registry_lookup_type(ctx->registry, qn)) {
+            return qn;
+        }
+    }
+    return NULL;
+}
+
 static char *dart_clean_type_name(DartLSPContext *ctx, const char *name) {
     if (!name) {
         return NULL;
@@ -659,8 +566,8 @@ const char *dart_resolve_class_name(DartLSPContext *ctx, const char *name) {
                 !dart_import_allows(import, member) || !import->module_qn) {
                 continue;
             }
-            const char *qn = dart_join(ctx->arena, import->module_qn, member);
-            if (cbm_registry_lookup_type(ctx->registry, qn)) {
+            const char *qn = dart_library_type_qn(ctx, import->module_qn, member);
+            if (qn) {
                 return qn;
             }
         }
@@ -677,8 +584,8 @@ const char *dart_resolve_class_name(DartLSPContext *ctx, const char *name) {
         if (import->prefix || !import->module_qn || !dart_import_allows(import, clean)) {
             continue;
         }
-        const char *qn = dart_join(ctx->arena, import->module_qn, clean);
-        if (cbm_registry_lookup_type(ctx->registry, qn)) {
+        const char *qn = dart_library_type_qn(ctx, import->module_qn, clean);
+        if (qn) {
             return qn;
         }
     }
@@ -695,17 +602,13 @@ const char *dart_resolve_class_name(DartLSPContext *ctx, const char *name) {
         }
     }
     if (core_allowed) {
-        static const char *async_types[] = {"Future", "Stream", NULL};
-        const char *package = "dart.core";
-        for (int i = 0; async_types[i]; i++) {
-            if (strcmp(clean, async_types[i]) == 0) {
-                package = "dart.async";
-                break;
+        int package_count = 0;
+        const char *const *packages = cbm_dart_default_import_packages(&package_count);
+        for (int i = 0; i < package_count; i++) {
+            const char *qn = dart_library_type_qn(ctx, packages[i], clean);
+            if (qn) {
+                return qn;
             }
-        }
-        const char *core_qn = dart_join(ctx->arena, package, clean);
-        if (cbm_registry_lookup_type(ctx->registry, core_qn)) {
-            return core_qn;
         }
     }
 
@@ -744,10 +647,14 @@ const char *dart_resolve_function_name(DartLSPContext *ctx, const char *name) {
         }
     }
     if (core_allowed) {
-        const char *qn = dart_join(ctx->arena, "dart.core", name);
-        const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
-        if (func && !func->receiver_type) {
-            return func->qualified_name;
+        int package_count = 0;
+        const char *const *packages = cbm_dart_default_import_packages(&package_count);
+        for (int i = 0; i < package_count; i++) {
+            const char *qn = dart_join(ctx->arena, packages[i], name);
+            const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
+            if (func && !func->receiver_type) {
+                return func->qualified_name;
+            }
         }
     }
     return NULL;
@@ -1007,10 +914,10 @@ static void dart_register_constructor(DartLSPContext *ctx, const char *class_qn,
     func.qualified_name = name ? dart_join(ctx->arena, class_qn, name) : class_qn;
     func.signature = dart_signature(ctx->arena, cbm_type_named(ctx->arena, class_qn));
     func.min_params = 0;
-    func.flags = CBM_FUNC_FLAG_STATICMETHOD | DART_FUNC_FLAG_CONSTRUCTOR;
+    func.flags = CBM_FUNC_FLAG_STATICMETHOD | CBM_DART_FUNC_FLAG_CONSTRUCTOR;
     const char *kind = ts_node_type(signature);
     if (strstr(kind, "factory_constructor_signature") != NULL) {
-        func.flags |= DART_FUNC_FLAG_FACTORY;
+        func.flags |= CBM_DART_FUNC_FLAG_FACTORY;
     }
     cbm_registry_add_func((CBMTypeRegistry *)ctx->registry, func);
 }
@@ -1264,7 +1171,7 @@ static void dart_register_type_members(DartLSPContext *ctx, TSNode node) {
     }
     const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, class_qn);
     if (!saw_constructor && dart_is(node, "class_definition") && type && !type->is_interface) {
-        dart_seed_constructor((CBMTypeRegistry *)ctx->registry, ctx->arena, class_qn, false);
+        dart_register_default_constructor((CBMTypeRegistry *)ctx->registry, ctx->arena, class_qn);
     }
 }
 
@@ -1381,7 +1288,9 @@ static void dart_eval_arguments(DartLSPContext *ctx, TSNode arguments) {
         if (dart_is(child, "type_arguments")) {
             continue;
         }
-        if (dart_is(child, "argument_part") || dart_is(child, "argument_list")) {
+        if (dart_is(child, "named_argument")) {
+            (void)dart_eval_chain(ctx, child);
+        } else if (dart_is(child, "argument_part") || dart_is(child, "argument_list")) {
             dart_eval_arguments(ctx, child);
         } else {
             (void)dart_eval_expr_type(ctx, child);
@@ -1431,10 +1340,21 @@ static const CBMType *dart_collection_literal_type(DartLSPContext *ctx, TSNode n
         }
     }
     uint32_t child_count = ts_node_named_child_count(node);
+    bool contains_chain = false;
     for (uint32_t i = 0; i < child_count; i++) {
-        TSNode child = ts_node_named_child(node, i);
-        if (!dart_is(child, "type_arguments")) {
-            (void)dart_eval_expr_type(ctx, child);
+        if (dart_is(ts_node_named_child(node, i), "selector")) {
+            contains_chain = true;
+            break;
+        }
+    }
+    if (contains_chain) {
+        (void)dart_eval_chain(ctx, node);
+    } else {
+        for (uint32_t i = 0; i < child_count; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (!dart_is(child, "type_arguments")) {
+                (void)dart_eval_expr_type(ctx, child);
+            }
         }
     }
     return cbm_type_template(ctx->arena, base_qn, args, arg_count);
@@ -1523,6 +1443,9 @@ static int dart_value_parts(TSNode container, TSNode *parts, int cap) {
         }
         if (!fields_only) {
             const char *child_kind = ts_node_type(child);
+            if (strcmp(kind, "named_argument") == 0 && strcmp(child_kind, "label") == 0) {
+                continue;
+            }
             if ((strcmp(kind, "const_object_expression") == 0 ||
                  strcmp(kind, "new_expression") == 0) &&
                 (strcmp(child_kind, "const_builtin") == 0 ||
@@ -1577,7 +1500,7 @@ static const CBMType *dart_apply_property(DartLSPContext *ctx, const CBMType *re
         const CBMRegisteredFunc *getter = cbm_registry_lookup_func(ctx->registry, qn);
         if (getter && (getter->flags & CBM_FUNC_FLAG_PROPERTY)) {
             dart_emit(ctx, getter->qualified_name, "lsp_dart_import_getter", DART_CONF_PROPERTY);
-            return dart_return_type(getter);
+            return dart_resolved_return_type(ctx, receiver, getter);
         }
         return cbm_type_unknown();
     }
@@ -1594,7 +1517,7 @@ static const CBMType *dart_apply_property(DartLSPContext *ctx, const CBMType *re
             return cbm_type_unknown();
         }
         dart_emit(ctx, getter->qualified_name, "lsp_dart_getter", DART_CONF_PROPERTY);
-        return dart_return_type(getter);
+        return dart_resolved_return_type(ctx, receiver, getter);
     }
     if (is_class_ref) {
         const CBMDartFieldInfo *field = dart_find_direct_field(ctx, receiver_qn, member);
@@ -1625,8 +1548,8 @@ static const CBMType *dart_apply_call(DartLSPContext *ctx, const CBMType *receiv
                 return dart_return_type(func);
             }
             const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
-            if (type && func && (func->flags & DART_FUNC_FLAG_CONSTRUCTOR) &&
-                (!type->is_interface || (func->flags & DART_FUNC_FLAG_FACTORY))) {
+            if (type && func && (func->flags & CBM_DART_FUNC_FLAG_CONSTRUCTOR) &&
+                (!type->is_interface || (func->flags & CBM_DART_FUNC_FLAG_FACTORY))) {
                 dart_emit(ctx, qn, "lsp_dart_constructor", DART_CONF_CONSTRUCTOR);
                 return cbm_type_named(ctx->arena, qn);
             }
@@ -1654,10 +1577,10 @@ static const CBMType *dart_apply_call(DartLSPContext *ctx, const CBMType *receiv
         } else if (was_this) {
             strategy = "lsp_dart_this";
         } else if (is_class_ref) {
-            if (func->flags & DART_FUNC_FLAG_CONSTRUCTOR) {
+            if (func->flags & CBM_DART_FUNC_FLAG_CONSTRUCTOR) {
                 const CBMRegisteredType *type =
                     cbm_registry_lookup_type(ctx->registry, receiver_qn);
-                if (type && type->is_interface && !(func->flags & DART_FUNC_FLAG_FACTORY)) {
+                if (type && type->is_interface && !(func->flags & CBM_DART_FUNC_FLAG_FACTORY)) {
                     return cbm_type_unknown();
                 }
                 strategy = "lsp_dart_constructor";
@@ -1668,15 +1591,15 @@ static const CBMType *dart_apply_call(DartLSPContext *ctx, const CBMType *receiv
             }
         }
         dart_emit(ctx, func->qualified_name, strategy, confidence);
-        return dart_return_type(func);
+        return dart_resolved_return_type(ctx, receiver, func);
     }
     if (is_class_ref) {
         const char *class_qn = dart_type_qn(receiver);
         if (class_qn) {
             const CBMRegisteredFunc *ctor = cbm_registry_lookup_func(ctx->registry, class_qn);
             const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, class_qn);
-            if (ctor && (ctor->flags & DART_FUNC_FLAG_CONSTRUCTOR) &&
-                (!type || !type->is_interface || (ctor->flags & DART_FUNC_FLAG_FACTORY))) {
+            if (ctor && (ctor->flags & CBM_DART_FUNC_FLAG_CONSTRUCTOR) &&
+                (!type || !type->is_interface || (ctor->flags & CBM_DART_FUNC_FLAG_FACTORY))) {
                 dart_emit(ctx, class_qn, "lsp_dart_constructor", DART_CONF_CONSTRUCTOR);
                 return cbm_type_named(ctx->arena, class_qn);
             }
@@ -1684,6 +1607,13 @@ static const CBMType *dart_apply_call(DartLSPContext *ctx, const CBMType *receiv
         return cbm_type_unknown();
     }
     if (base_name && !module_qn && !dart_scope_contains(ctx->current_scope, base_name)) {
+        const char *this_qn = dart_type_qn(ctx->this_type);
+        const CBMRegisteredFunc *method =
+            this_qn ? dart_lookup_method(ctx, this_qn, base_name) : NULL;
+        if (method && !(method->flags & CBM_FUNC_FLAG_STATICMETHOD)) {
+            dart_emit(ctx, method->qualified_name, "lsp_dart_this", DART_CONF_METHOD);
+            return dart_resolved_return_type(ctx, ctx->this_type, method);
+        }
         const char *qn = dart_resolve_function_name(ctx, base_name);
         const CBMRegisteredFunc *func = qn ? cbm_registry_lookup_func(ctx->registry, qn) : NULL;
         if (func && !func->receiver_type) {
@@ -1826,6 +1756,50 @@ static bool dart_has_direct_chain(TSNode node) {
     return false;
 }
 
+static const CBMType *dart_eval_generic_relational_call(DartLSPContext *ctx, TSNode node) {
+    char *text = dart_node_text(ctx, node);
+    if (!text) {
+        return cbm_type_unknown();
+    }
+    char *lt = strchr(text, '<');
+    char *gt = lt ? strrchr(lt + 1, '>') : NULL;
+    char *open = gt ? strchr(gt + 1, '(') : NULL;
+    char *dot = lt ? lt : NULL;
+    while (dot && dot > text && *dot != '.') {
+        dot--;
+    }
+    if (!lt || !gt || !open || !dot || *dot != '.' || dot == text || dot + 1 == lt) {
+        return cbm_type_unknown();
+    }
+    for (char *p = text; p < dot; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '$')) {
+            return cbm_type_unknown();
+        }
+    }
+    for (char *p = dot + 1; p < lt; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '_' || *p == '$')) {
+            return cbm_type_unknown();
+        }
+    }
+    *dot = '\0';
+    *lt = '\0';
+    const char *base_name = text;
+    const char *member = dot + 1;
+    const CBMType *receiver = cbm_scope_lookup(ctx->current_scope, base_name);
+    bool is_class_ref = false;
+    if (cbm_type_is_unknown(receiver)) {
+        const char *class_qn = dart_resolve_class_name(ctx, base_name);
+        if (!class_qn) {
+            return cbm_type_unknown();
+        }
+        receiver = cbm_type_named(ctx->arena, class_qn);
+        is_class_ref = true;
+    }
+    TSNode arguments = dart_find_kind(node, "parenthesized_expression", 5);
+    return dart_apply_call(ctx, receiver, base_name, member, NULL, is_class_ref, false, false,
+                           arguments);
+}
+
 const CBMType *dart_eval_expr_type(DartLSPContext *ctx, TSNode node) {
     if (!ctx || ts_node_is_null(node) || ctx->eval_depth >= DART_EVAL_MAX_DEPTH) {
         return cbm_type_unknown();
@@ -1873,6 +1847,13 @@ const CBMType *dart_eval_expr_type(DartLSPContext *ctx, TSNode node) {
         result = dart_eval_expr_type(ctx, right);
         goto done;
     }
+    if (strcmp(kind, "relational_expression") == 0) {
+        const CBMType *generic_call = dart_eval_generic_relational_call(ctx, node);
+        if (!cbm_type_is_unknown(generic_call)) {
+            result = generic_call;
+            goto done;
+        }
+    }
     if (strcmp(kind, "type_test_expression") == 0 || strcmp(kind, "equality_expression") == 0 ||
         strcmp(kind, "relational_expression") == 0 || strcmp(kind, "logical_or_expression") == 0 ||
         strcmp(kind, "logical_and_expression") == 0) {
@@ -1883,7 +1864,11 @@ const CBMType *dart_eval_expr_type(DartLSPContext *ctx, TSNode node) {
         result = cbm_type_named(ctx->arena, "dart.core.bool");
         goto done;
     }
-    if (strcmp(kind, "conditional_expression") == 0 || strcmp(kind, "if_null_expression") == 0) {
+    if (strcmp(kind, "if_null_expression") == 0) {
+        result = dart_eval_chain(ctx, node);
+        goto done;
+    }
+    if (strcmp(kind, "conditional_expression") == 0) {
         uint32_t count = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < count; i++) {
             const CBMType *candidate = dart_eval_expr_type(ctx, ts_node_named_child(node, i));
@@ -2357,7 +2342,8 @@ void cbm_run_dart_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     }
     CBMTypeRegistry registry;
     cbm_registry_init(&registry, arena);
-    dart_seed_core(&registry, arena);
+    cbm_dart_stdlib_register(&registry, arena);
+    cbm_dart_flutter_seed_register(&registry, arena);
 
     const char *module_qn = result->module_qn ? result->module_qn : "";
     const char *project_name = module_qn;

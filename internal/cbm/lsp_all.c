@@ -23,6 +23,8 @@
 #include "lsp/generated/java_stdlib_data.c"
 #include "lsp/generated/kotlin_stdlib_data.c"
 #include "lsp/kotlin_lsp.c"
+#include "lsp/generated/dart_stdlib_data.c"
+#include "lsp/generated/dart_flutter_seed.c"
 #include "lsp/dart_lsp.c"
 #include "lsp/generated/rust_stdlib_data.c"
 #include "lsp/generated/rust_crates_seed.c"

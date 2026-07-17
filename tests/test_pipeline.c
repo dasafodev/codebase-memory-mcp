@@ -2214,6 +2214,55 @@ TEST(pipeline_dart_cross_lsp_supported) {
     PASS();
 }
 
+/* Production-pipeline regression for Dart's flat selector grammar. The
+ * semantic pass resolves all three member invocations below, but the generic
+ * call extractor cannot represent every selector in a chained expression.
+ * Duplicate ping() declarations make the name-only fallback intentionally
+ * ambiguous, so both exact edges prove that the LSP results reached the graph
+ * rather than merely existing on CBMFileResult. */
+TEST(pipeline_dart_per_file_lsp_edges_materialized) {
+    const char *files[] = {"pubspec.yaml", "lib/main.dart"};
+    const char *contents[] = {
+        "name: dart_per_file_fixture\n",
+        "class Alpha {\n"
+        "  void ping() {}\n"
+        "  Beta makeBeta() => Beta();\n"
+        "}\n"
+        "class Beta {\n"
+        "  void ping() {}\n"
+        "}\n"
+        "void runDartTypedDispatchFixture() {\n"
+        "  final Alpha a = Alpha();\n"
+        "  a.ping();\n"
+        "  a.makeBeta().ping();\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartTypedDispatchFixture", "lib.main.Alpha.ping", "lsp_dart_method"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartTypedDispatchFixture", "lib.main.Alpha.makeBeta", "lsp_dart_method"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartTypedDispatchFixture", "lib.main.Beta.ping", "lsp_dart_method"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 /* One compact Flutter-style library fixture covers the pipeline seams that
  * differ from the per-file Dart pass: pubspec-backed package: URIs, a
  * one-level re-export, relative-import precedence, and part scope (including
@@ -2437,6 +2486,7 @@ TEST(pipeline_dart_parallel_cross_lsp_not_count_gated) {
 
     bool linked = false;
     bool linked_decoy = false;
+    bool linked_local_method = false;
     cbm_store_t *s = rc == 0 ? cbm_store_open_path(db) : NULL;
     if (s) {
         const char *proj = cbm_pipeline_project_name(p);
@@ -2444,6 +2494,9 @@ TEST(pipeline_dart_parallel_cross_lsp_not_count_gated) {
             s, proj, "runDartParallelFixture", "lib.service.packageParallelHelper", "lsp_dart_");
         linked_decoy = cross_file_call_exists_to_qn_suffix(
             s, proj, "runDartParallelFixture", "lib.decoy.packageParallelHelper", NULL);
+        linked_local_method = cross_file_call_exists_to_qn_suffix(
+            s, proj, "runDartParallelFixture", "lib.main.LocalParallelWorker.localTouch",
+            "lsp_dart_method");
         cbm_store_close(s);
     }
 
@@ -2459,6 +2512,7 @@ TEST(pipeline_dart_parallel_cross_lsp_not_count_gated) {
     ASSERT_EQ(rc, 0);
     ASSERT_TRUE(linked);
     ASSERT_FALSE(linked_decoy);
+    ASSERT_TRUE(linked_local_method);
     PASS();
 }
 
@@ -7245,6 +7299,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_dart_cross_lsp_supported);
+    RUN_TEST(pipeline_dart_per_file_lsp_edges_materialized);
     RUN_TEST(pipeline_dart_cross_library_resolution);
     RUN_TEST(pipeline_dart_parallel_cross_lsp_not_count_gated);
     RUN_TEST(pipeline_python_cross_module_call);

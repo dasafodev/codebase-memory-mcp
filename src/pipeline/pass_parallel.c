@@ -2418,6 +2418,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         ws->calls_resolved++;
     }
+    if (lang == CBM_LANG_DART) {
+        int direct = cbm_pipeline_materialize_dart_lsp_calls(
+            ws->local_edge_buf, rc->main_gbuf, rc->project_name, &result->resolved_calls);
+        ws->calls_resolved += direct;
+        ws->lsp_overrides += direct;
+    }
     if (lsp_idx) {
         cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_idx);
@@ -2742,10 +2748,14 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
              (always_run_cross_lsp || result->resolved_calls.count < result->calls.count) &&
              !is_generated);
 
+        bool has_direct_dart_lsp =
+            lang == CBM_LANG_DART &&
+            cbm_pipeline_has_dart_invocation_resolutions(&result->resolved_calls);
+
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
             result->rw.count == 0 && result->defs.count == 0 && result->impl_traits.count == 0 &&
-            !cross_lsp_eligible) {
+            !cross_lsp_eligible && !has_direct_dart_lsp) {
             continue;
         }
 

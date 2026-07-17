@@ -11,6 +11,7 @@
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
@@ -848,6 +849,49 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     if (tgts) {
         cbm_store_free_nodes(tgts, tc);
     }
+    return found;
+}
+
+/* Like cross_file_call_exists, but identifies the target by qualified-name
+ * suffix. This lets cross-LSP tests prove that receiver typing selected the
+ * intended declaration when multiple files define the same short name. */
+static bool cross_file_call_exists_to_qn_suffix(cbm_store_t *s, const char *project,
+                                                const char *src_name,
+                                                const char *tgt_qn_suffix,
+                                                const char *strategy_prefix) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_qn_suffix(s, project, tgt_qn_suffix, &tgts, &tc);
+
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                bool strategy_matches = strategy_prefix == NULL;
+                if (!strategy_matches && edges[j].properties_json) {
+                    char needle[128];
+                    snprintf(needle, sizeof(needle), "\"strategy\":\"%s", strategy_prefix);
+                    strategy_matches = strstr(edges[j].properties_json, needle) != NULL;
+                }
+                if (edges[j].target_id == tgts[k].id && strategy_matches) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    if (srcs)
+        cbm_store_free_nodes(srcs, sc);
+    if (tgts)
+        cbm_store_free_nodes(tgts, tc);
     return found;
 }
 
@@ -2162,6 +2206,259 @@ TEST(pipeline_go_cross_package_call) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_dart_cross_lsp_supported) {
+    ASSERT_TRUE(cbm_pxc_has_cross_lsp(CBM_LANG_DART));
+    PASS();
+}
+
+/* One compact Flutter-style library fixture covers the pipeline seams that
+ * differ from the per-file Dart pass: pubspec-backed package: URIs, a
+ * one-level re-export, relative-import precedence, and part scope (including
+ * public part declarations consumed outside their library). Duplicate short
+ * names make the generic matcher ambiguous, so each exact target assertion is
+ * a cross-LSP quality guard. The barrel also verifies that export directives
+ * do not add their targets to the barrel's own lexical scope. */
+TEST(pipeline_dart_cross_library_resolution) {
+    const char *files[] = {"pubspec.yaml",            "service.dart",
+                           "lib/service.dart",         "lib/decoy.dart",
+                           "lib/barrel.dart",          "lib/helpers.dart",
+                           "lib/model.dart",           "lib/model.g.dart",
+                           "lib/model.extra.dart",     "lib/main.dart",
+                           "lib/consumer.dart",        "lib/feature/service.dart",
+                           "lib/feature/main.dart",    "lib/feature/missing.dart",
+                           "lib/feature/dot.dart",     "lib/feature/parent.dart",
+                           "nested_fixture/lib/feature/missing/service.dart",
+                           "lib/service.part.dart"};
+    const char *contents[] = {
+        "name: dart_cross_fixture\n",
+        "void nestedRelativeHelper() {}\n",
+        "part 'service.part.dart';\n"
+        "void packageHelper() {}\n"
+        "void reexportedHelper() {}\n"
+        "void hiddenByBarrel() {}\n"
+        "void nestedRelativeHelper() {}\n",
+        "void packageHelper() {}\n"
+        "void reexportedHelper() {}\n"
+        "void reexportedPartHelper() {}\n"
+        "void hiddenByBarrel() {}\n"
+        "void generatedPartHelper() {}\n"
+        "void _generated() {}\n"
+        "void helperFromOwner() {}\n"
+        "void _siblingGenerated() {}\n",
+        "export 'service.dart' show reexportedHelper, reexportedPartHelper;\n"
+        "void runDartBarrelScopeFixture() {\n"
+        "  reexportedHelper();\n"
+        "}\n",
+        "void helperFromOwner() {}\n"
+        "void hiddenOwnerHelper() {}\n",
+        "import 'helpers.dart' as helpers show helperFromOwner hide hiddenOwnerHelper;\n"
+        "import 'barrel.dart' show reexportedHelper, reexportedPartHelper;\n"
+        "part 'model.g.dart';\n"
+        "part 'model.extra.dart';\n"
+        "void runDartPartFixture() {\n"
+        "  _generated();\n"
+        "}\n",
+        "part of 'model.dart';\n"
+        "void _generated() {\n"
+        "  helpers.helperFromOwner();\n"
+        "  helpers.hiddenOwnerHelper();\n"
+        "  reexportedHelper();\n"
+        "  reexportedPartHelper();\n"
+        "  _siblingGenerated();\n"
+        "}\n"
+        "void generatedPartHelper() {}\n",
+        "part of 'model.dart';\n"
+        "void _siblingGenerated() {}\n",
+        "import 'package:dart_cross_fixture/service.dart' show packageHelper;\n"
+        "import 'package:dart_cross_fixture/barrel.dart' show reexportedHelper, "
+        "reexportedPartHelper, hiddenByBarrel;\n"
+        "void runDartPackageFixture() {\n"
+        "  packageHelper();\n"
+        "  reexportedHelper();\n"
+        "  reexportedPartHelper();\n"
+        "  hiddenByBarrel();\n"
+        "}\n",
+        "import 'model.dart' show generatedPartHelper;\n"
+        "void runDartGeneratedPartConsumer() {\n"
+        "  generatedPartHelper();\n"
+        "}\n",
+        "void nestedRelativeHelper() {}\n",
+        "import 'service.dart' show nestedRelativeHelper;\n"
+        "void runDartNestedRelativeFixture() {\n"
+        "  nestedRelativeHelper();\n"
+        "}\n",
+        "import 'missing/service.dart' show nestedRelativeHelper;\n"
+        "void runDartMissingNestedFixture() {\n"
+        "  nestedRelativeHelper();\n"
+        "}\n",
+        "import './service.dart' show nestedRelativeHelper;\n"
+        "void runDartDotRelativeFixture() {\n"
+        "  nestedRelativeHelper();\n"
+        "}\n",
+        "import '../service.dart' show packageHelper;\n"
+        "void runDartParentRelativeFixture() {\n"
+        "  packageHelper();\n"
+        "}\n",
+        "void nestedRelativeHelper() {}\n",
+        "part of 'service.dart';\n"
+        "void reexportedPartHelper() {}\n"};
+
+    if (setup_lang_repo(files, contents, 18) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+    cbm_node_t *relative_decoys = NULL;
+    int relative_decoy_count = 0;
+    cbm_store_find_nodes_by_qn_suffix(
+        s, proj, "nested_fixture.lib.feature.missing.service.nestedRelativeHelper",
+        &relative_decoys, &relative_decoy_count);
+    ASSERT_GTE(relative_decoy_count, 1);
+    cbm_store_free_nodes(relative_decoys, relative_decoy_count);
+
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartPackageFixture", "lib.service.packageHelper", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartPackageFixture", "lib.decoy.packageHelper", NULL));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(s, proj, "runDartPackageFixture",
+                                                    "lib.service.reexportedHelper", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(s, proj, "runDartPackageFixture",
+                                                     "lib.decoy.reexportedHelper", NULL));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartPackageFixture", "lib.service.hiddenByBarrel", "lsp_dart_"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartPackageFixture", "lib.service.part.reexportedPartHelper",
+        "lsp_dart_"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(s, proj, "runDartPartFixture",
+                                                    "lib.model.g._generated", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(s, proj, "runDartPartFixture",
+                                                     "lib.decoy._generated", NULL));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(s, proj, "_generated",
+                                                    "lib.helpers.helperFromOwner", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "_generated", "lib.helpers.hiddenOwnerHelper", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(s, proj, "_generated",
+                                                     "lib.decoy.helperFromOwner", NULL));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "_generated", "lib.model.extra._siblingGenerated", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "_generated", "lib.decoy._siblingGenerated", NULL));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "_generated", "lib.service.reexportedHelper", "lsp_dart_"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "_generated", "lib.service.part.reexportedPartHelper", "lsp_dart_"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartNestedRelativeFixture", "lib.feature.service.nestedRelativeHelper",
+        "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartNestedRelativeFixture", "lib.service.nestedRelativeHelper", NULL));
+    char root_relative_decoy_qn[512];
+    snprintf(root_relative_decoy_qn, sizeof(root_relative_decoy_qn),
+             "%s.service.nestedRelativeHelper", proj);
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartNestedRelativeFixture", root_relative_decoy_qn, NULL));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartMissingNestedFixture",
+        "lib.feature.service.nestedRelativeHelper", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartMissingNestedFixture",
+        "nested_fixture.lib.feature.missing.service.nestedRelativeHelper", "lsp_dart_"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartDotRelativeFixture", "lib.feature.service.nestedRelativeHelper",
+        "lsp_dart_"));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartParentRelativeFixture", "lib.service.packageHelper", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartBarrelScopeFixture", "lib.service.reexportedHelper", NULL));
+    ASSERT_TRUE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartGeneratedPartConsumer", "lib.model.g.generatedPartHelper", "lsp_dart_"));
+    ASSERT_FALSE(cross_file_call_exists_to_qn_suffix(
+        s, proj, "runDartGeneratedPartConsumer", "lib.decoy.generatedPartHelper", NULL));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* Parallel cross-LSP eligibility regression. Dart's flat selector chain makes
+ * `LocalParallelWorker().localTouch()` one textual constructor call while the
+ * per-file semantic walk resolves both the constructor and method. Together
+ * with the unresolved imported helper, resolved_calls.count can therefore
+ * equal calls.count even though cross-file work remains. The old count gate
+ * skipped main.dart in that state; >50 Dart files force that parallel path. */
+TEST(pipeline_dart_parallel_cross_lsp_not_count_gated) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_dart_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp))
+        FAIL("tmpdir");
+
+    write_temp_file(tmp, "pubspec.yaml", "name: dart_parallel_fixture\n");
+    write_temp_file(tmp, "lib/service.dart", "void packageParallelHelper() {}\n");
+    write_temp_file(tmp, "lib/decoy.dart", "void packageParallelHelper() {}\n");
+    write_temp_file(tmp, "lib/main.dart",
+                    "import 'package:dart_parallel_fixture/service.dart' show "
+                    "packageParallelHelper;\n"
+                    "class LocalParallelWorker {\n"
+                    "  void localTouch() {}\n"
+                    "}\n"
+                    "void runDartParallelFixture() {\n"
+                    "  LocalParallelWorker().localTouch();\n"
+                    "  packageParallelHelper();\n"
+                    "}\n");
+
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[96];
+        snprintf(name, sizeof(name), "lib/filler_%02d.dart", i);
+        snprintf(body, sizeof(body), "void dartParallelFiller%02d() {}\n", i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+
+    bool linked = false;
+    bool linked_decoy = false;
+    cbm_store_t *s = rc == 0 ? cbm_store_open_path(db) : NULL;
+    if (s) {
+        const char *proj = cbm_pipeline_project_name(p);
+        linked = cross_file_call_exists_to_qn_suffix(
+            s, proj, "runDartParallelFixture", "lib.service.packageParallelHelper", "lsp_dart_");
+        linked_decoy = cross_file_call_exists_to_qn_suffix(
+            s, proj, "runDartParallelFixture", "lib.decoy.packageParallelHelper", NULL);
+        cbm_store_close(s);
+    }
+
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(linked);
+    ASSERT_FALSE(linked_decoy);
     PASS();
 }
 
@@ -6947,6 +7244,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_dart_cross_lsp_supported);
+    RUN_TEST(pipeline_dart_cross_library_resolution);
+    RUN_TEST(pipeline_dart_parallel_cross_lsp_not_count_gated);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);

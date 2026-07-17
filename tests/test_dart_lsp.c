@@ -66,6 +66,34 @@ static int dart_require_resolved(const CBMFileResult *result, const char *caller
     return found;
 }
 
+static int dart_find_resolved_arr_exact(const CBMResolvedCallArray *calls, const char *caller,
+                                        const char *callee) {
+    for (int i = 0; i < calls->count; i++) {
+        const CBMResolvedCall *call = &calls->items[i];
+        if (call->caller_qn && call->callee_qn && strstr(call->caller_qn, caller) &&
+            strcmp(call->callee_qn, callee) == 0) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static int dart_require_resolved_arr_exact(const CBMResolvedCallArray *calls, const char *caller,
+                                           const char *callee) {
+    int found = dart_find_resolved_arr_exact(calls, caller, callee);
+    if (found < 0) {
+        printf("  missing Dart cross-file call: %s -> %s (have %d)\n", caller, callee,
+               calls->count);
+        for (int i = 0; i < calls->count; i++) {
+            const CBMResolvedCall *call = &calls->items[i];
+            printf("    %s -> %s [%s]\n", call->caller_qn ? call->caller_qn : "(null)",
+                   call->callee_qn ? call->callee_qn : "(null)",
+                   call->strategy ? call->strategy : "(null)");
+        }
+    }
+    return found;
+}
+
 TEST(dartlsp_core_print) {
     CBMFileResult *r = extract_dart_lsp("void main() { print('hello'); }\n");
     ASSERT_NOT_NULL(r);
@@ -1156,6 +1184,685 @@ TEST(dartlsp_hidden_package_symbol_abstains) {
     PASS();
 }
 
+TEST(dartlsp_cross_package_bare_call) {
+    const char *source =
+        "import 'package:fixture/src/service.dart' show fetchRemote;\n"
+        "void run() { fetchRemote(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.main.run",
+         .short_name = "run",
+         .label = "Function",
+         .def_module_qn = "test.lib.main",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.src.service.fetchRemote",
+         .short_name = "fetchRemote",
+         .label = "Function",
+         .def_module_qn = "test.lib.src.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"package:fixture/src/service.dart"};
+    const char *import_qns[] = {"test.lib.src.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 2,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.src.service.fetchRemote"),
+               0);
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.run", "fixture.lib.src.service.fetchRemote"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_relative_bare_call) {
+    const char *source =
+        "import '../shared/service.dart' show fetchRelative;\n"
+        "void run() { fetchRelative(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.feature.main.run",
+         .short_name = "run",
+         .label = "Function",
+         .def_module_qn = "test.lib.feature.main",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.shared.service.fetchRelative",
+         .short_name = "fetchRelative",
+         .label = "Function",
+         .def_module_qn = "test.lib.shared.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"../shared/service.dart"};
+    const char *import_qns[] = {"test.lib.shared.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.feature.main", defs, 2,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.feature.main.run", "test.lib.shared.service.fetchRelative"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_prefix_show_hide) {
+    const char *source =
+        "import '../shared/service.dart' as svc show allowed hide hidden;\n"
+        "void prefixed() { svc.allowed(); svc.hidden(); }\n"
+        "void bare() { allowed(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.shared.service.allowed",
+         .short_name = "allowed",
+         .label = "Function",
+         .def_module_qn = "test.lib.shared.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.shared.service.hidden",
+         .short_name = "hidden",
+         .label = "Function",
+         .def_module_qn = "test.lib.shared.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"../shared/service.dart"};
+    const char *import_qns[] = {"test.lib.shared.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.feature.main", defs, 2,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.feature.main.prefixed", "test.lib.shared.service.allowed"),
+               0);
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.feature.main.prefixed", "test.lib.shared.service.hidden"),
+              -1);
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.feature.main.bare", "test.lib.shared.service.allowed"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_reexport_bare_call) {
+    const char *source =
+        "import 'api.dart' show publicHelper;\n"
+        "void run() { publicHelper(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.main.run",
+         .short_name = "run",
+         .label = "Function",
+         .def_module_qn = "test.lib.main",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.src.service.publicHelper",
+         .short_name = "publicHelper",
+         .label = "Function",
+         .def_module_qn = "test.lib.src.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"api.dart", "api.dart"};
+    const char *import_qns[] = {"test.lib.api", "test.lib.src.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 2,
+                           import_names, import_qns, 2, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.src.service.publicHelper"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_part_private_method) {
+    const char *source =
+        "part 'model.g.dart';\n"
+        "int run(Generated value) => value._read();\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.model.g.Generated",
+         .short_name = "Generated",
+         .label = "Class",
+         .def_module_qn = "test.lib.model.g",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.model.g.Generated._read",
+         .short_name = "_read",
+         .label = "Method",
+         .receiver_type = "test.lib.model.g.Generated",
+         .def_module_qn = "test.lib.model.g",
+         .return_types = "int",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN},
+    };
+    const char *import_names[] = {"model.g.dart"};
+    const char *import_qns[] = {"test.lib.model.g"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.model", defs, 2,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.model.run", "test.lib.model.g.Generated._read"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_part_of_owner_private) {
+    const char *source =
+        "part of 'model.dart';\n"
+        "int generated() => _ownerPrivate();\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.model._ownerPrivate",
+         .short_name = "_ownerPrivate",
+         .label = "Function",
+         .def_module_qn = "test.lib.model",
+         .return_types = "int",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"model.dart"};
+    const char *import_qns[] = {"test.lib.model"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.model.g", defs, 1,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.model.g.generated", "test.lib.model._ownerPrivate"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_regular_import_private_abstains) {
+    const char *source =
+        "import 'model.dart';\n"
+        "int run() => _ownerPrivate();\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.model._ownerPrivate",
+         .short_name = "_ownerPrivate",
+         .label = "Function",
+         .def_module_qn = "test.lib.model",
+         .return_types = "int",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"model.dart"};
+    const char *import_qns[] = {"test.lib.model"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.other", defs, 1,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.other.run", "test.lib.model._ownerPrivate"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_inherited_method_dispatch) {
+    const char *source =
+        "import 'animals.dart' show Dog;\n"
+        "void run(Dog dog) { dog.speak(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.animals.Animal",
+         .short_name = "Animal",
+         .label = "Class",
+         .def_module_qn = "test.lib.animals",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.animals.Dog",
+         .short_name = "Dog",
+         .label = "Class",
+         .def_module_qn = "test.lib.animals",
+         .embedded_types = "test.lib.animals.Animal",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.animals.Animal.speak",
+         .short_name = "speak",
+         .label = "Method",
+         .receiver_type = "test.lib.animals.Animal",
+         .def_module_qn = "test.lib.animals",
+         .return_types = "void",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN},
+    };
+    const char *import_names[] = {"animals.dart"};
+    const char *import_qns[] = {"test.lib.animals"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 3,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.animals.Animal.speak"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_return_type_chain) {
+    const char *source =
+        "import 'client.dart' show makeClient;\n"
+        "void run() { makeClient().send(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.client.Client",
+         .short_name = "Client",
+         .label = "Class",
+         .def_module_qn = "test.lib.client",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.client.makeClient",
+         .short_name = "makeClient",
+         .label = "Function",
+         .def_module_qn = "test.lib.client",
+         .return_types = "Client",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.client.Client.send",
+         .short_name = "send",
+         .label = "Method",
+         .receiver_type = "test.lib.client.Client",
+         .def_module_qn = "test.lib.client",
+         .return_types = "void",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN},
+    };
+    const char *import_names[] = {"client.dart"};
+    const char *import_qns[] = {"test.lib.client"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 3,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.client.makeClient"),
+               0);
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.client.Client.send"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_conditional_import_abstains) {
+    const char *source =
+        "import 'stub.dart' if (dart.library.io) 'io.dart' show platformCall;\n"
+        "void run() { platformCall(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.stub.platformCall",
+         .short_name = "platformCall",
+         .label = "Function",
+         .def_module_qn = "test.lib.stub",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.io.platformCall",
+         .short_name = "platformCall",
+         .label = "Function",
+         .def_module_qn = "test.lib.io",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"stub.dart", "io.dart"};
+    const char *import_qns[] = {"test.lib.stub", "test.lib.io"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 2,
+                           import_names, import_qns, 2, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.run", "test.lib.stub.platformCall"),
+              -1);
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.run", "test.lib.io.platformCall"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_local_core_name_shadowing) {
+    const char *source =
+        "import 'domain.dart' show makeString, makeFuture;\n"
+        "void run() { makeString().localOnly(); makeFuture().localOnly(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.domain.String",
+         .short_name = "String",
+         .label = "Class",
+         .def_module_qn = "test.lib.domain",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.domain.String.localOnly",
+         .short_name = "localOnly",
+         .label = "Method",
+         .receiver_type = "test.lib.domain.String",
+         .def_module_qn = "test.lib.domain",
+         .return_types = "void",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN},
+        {.qualified_name = "test.lib.domain.Future",
+         .short_name = "Future",
+         .label = "Class",
+         .def_module_qn = "test.lib.domain",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.domain.Future.localOnly",
+         .short_name = "localOnly",
+         .label = "Method",
+         .receiver_type = "test.lib.domain.Future",
+         .def_module_qn = "test.lib.domain",
+         .return_types = "void",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN},
+        {.qualified_name = "test.lib.domain.makeString",
+         .short_name = "makeString",
+         .label = "Function",
+         .def_module_qn = "test.lib.domain",
+         .return_types = "String",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.domain.makeFuture",
+         .short_name = "makeFuture",
+         .label = "Function",
+         .def_module_qn = "test.lib.domain",
+         .return_types = "Future",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"domain.dart"};
+    const char *import_qns[] = {"test.lib.domain"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 6,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.domain.String.localOnly"),
+               0);
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.domain.Future.localOnly"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_static_method_receiver_kind) {
+    const char *source =
+        "import 'tools.dart' show Tool;\n"
+        "void invalid(Tool tool) { tool.reset(); }\n"
+        "void valid() { Tool.reset(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.tools.Tool",
+         .short_name = "Tool",
+         .label = "Class",
+         .def_module_qn = "test.lib.tools",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.tools.Tool.reset",
+         .short_name = "reset",
+         .label = "Method",
+         .receiver_type = "test.lib.tools.Tool",
+         .def_module_qn = "test.lib.tools",
+         .return_types = "void",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN | CBM_DEF_CALLABLE_STATIC},
+    };
+    const char *import_names[] = {"tools.dart"};
+    const char *import_qns[] = {"test.lib.tools"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 2,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.invalid", "test.lib.tools.Tool.reset"),
+              -1);
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.valid", "test.lib.tools.Tool.reset"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_private_imported_base_member_abstains) {
+    const char *source =
+        "import 'external.dart' show ExternalBase;\n"
+        "class Child extends ExternalBase {}\n"
+        "void run(Child child) { child._secret(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.external.ExternalBase",
+         .short_name = "ExternalBase",
+         .label = "Class",
+         .def_module_qn = "test.lib.external",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.external.ExternalBase._secret",
+         .short_name = "_secret",
+         .label = "Method",
+         .receiver_type = "test.lib.external.ExternalBase",
+         .def_module_qn = "test.lib.external",
+         .return_types = "void",
+         .lang = CBM_LANG_DART,
+         .callable_flags = CBM_DEF_CALLABLE_KNOWN},
+    };
+    const char *import_names[] = {"external.dart"};
+    const char *import_qns[] = {"test.lib.external"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 2,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.run", "test.lib.external.ExternalBase._secret"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_hide_overflow_abstains) {
+    const char *source =
+        "import 'service.dart' hide "
+        "h00, h01, h02, h03, h04, h05, h06, h07, "
+        "h08, h09, h10, h11, h12, h13, h14, h15, "
+        "h16, h17, h18, h19, h20, h21, h22, h23, "
+        "h24, h25, h26, h27, h28, h29, h30, h31, "
+        "h32, h33, h34, h35, h36, h37, h38, h39, "
+        "h40, h41, h42, h43, h44, h45, h46, h47, "
+        "h48, h49, h50, h51, h52, h53, h54, h55, "
+        "h56, h57, h58, h59, h60, h61, h62, h63, blocked;\n"
+        "void run() { blocked(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.service.blocked",
+         .short_name = "blocked",
+         .label = "Function",
+         .def_module_qn = "test.lib.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {"service.dart"};
+    const char *import_qns[] = {"test.lib.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 1,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.run", "test.lib.service.blocked"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_part_inherits_implicit_core) {
+    const char *source =
+        "part of 'model.dart';\n"
+        "void generated(String value) { value.toUpperCase(); }\n";
+    const char *import_names[] = {"model.dart"};
+    const char *import_qns[] = {"test.lib.model"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.model.g", NULL, 0,
+                           import_names, import_qns, 1, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.model.g.generated", "dart.core.String.toUpperCase"),
+               0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_part_restricted_core_abstains) {
+    const char *source =
+        "part of 'model.dart';\n"
+        "void generated(String value) { value.toUpperCase(); }\n";
+    const char *import_names[] = {"model.dart", "@dart-part-core-blocked"};
+    const char *import_qns[] = {"test.lib.model", "dart.core"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.model.g", NULL, 0,
+                           import_names, import_qns, 2, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.model.g.generated", "dart.core.String.toUpperCase"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_reexport_show_hide) {
+    const char *source =
+        "import 'barrel.dart' show allowed, hidden;\n"
+        "void run() { allowed(); hidden(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.service.allowed",
+         .short_name = "allowed",
+         .label = "Function",
+         .def_module_qn = "test.lib.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.service.hidden",
+         .short_name = "hidden",
+         .label = "Function",
+         .def_module_qn = "test.lib.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {
+        "barrel.dart", "@dart-export-filter:S:allowed;H:hidden;|barrel.dart"};
+    const char *import_qns[] = {"test.lib.barrel", "test.lib.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.main", defs, 2,
+                           import_names, import_qns, 2, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.main.run", "test.lib.service.allowed"),
+               0);
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.main.run", "test.lib.service.hidden"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_part_external_package_collision_abstains) {
+    const char *source =
+        "part of 'owner.dart';\n"
+        "void generated() { externalHelper(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "dep.lib.api.externalHelper",
+         .short_name = "externalHelper",
+         .label = "Function",
+         .def_module_qn = "dep.lib.api",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {
+        "owner.dart", "@dart-part-import:package:dep/api.dart"};
+    const char *import_qns[] = {
+        "dep.lib.owner", "@dart-external-module:dep.lib.api"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "dep.lib.owner.g", defs, 1,
+                           import_names, import_qns, 2, NULL, &out);
+
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "dep.lib.owner.g.generated", "dep.lib.api.externalHelper"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(dartlsp_cross_part_inherits_prefixed_filter) {
+    const char *source =
+        "part of 'owner.dart';\n"
+        "void generated() { svc.allowed(); svc.hidden(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.service.allowed",
+         .short_name = "allowed",
+         .label = "Function",
+         .def_module_qn = "test.lib.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+        {.qualified_name = "test.lib.service.hidden",
+         .short_name = "hidden",
+         .label = "Function",
+         .def_module_qn = "test.lib.service",
+         .return_types = "void",
+         .lang = CBM_LANG_DART},
+    };
+    const char *import_names[] = {
+        "owner.dart", "@dart-part-filter:P:svc;S:allowed;H:hidden;|service.dart"};
+    const char *import_qns[] = {"test.lib.owner", "test.lib.service"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_dart_lsp_cross(&arena, source, (int)strlen(source), "test.lib.owner.g", defs, 2,
+                           import_names, import_qns, 2, NULL, &out);
+
+    ASSERT_GTE(dart_require_resolved_arr_exact(
+                   &out, "test.lib.owner.g.generated", "test.lib.service.allowed"),
+               0);
+    ASSERT_EQ(dart_find_resolved_arr_exact(
+                  &out, "test.lib.owner.g.generated", "test.lib.service.hidden"),
+              -1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 SUITE(dart_lsp) {
     RUN_TEST(dartlsp_core_print);
     RUN_TEST(dartlsp_local_top_level_call);
@@ -1271,4 +1978,23 @@ SUITE(dart_lsp) {
     RUN_TEST(dartlsp_shared_preferences_await_chain);
     RUN_TEST(dartlsp_unimported_flutter_abstains);
     RUN_TEST(dartlsp_hidden_package_symbol_abstains);
+    RUN_TEST(dartlsp_cross_package_bare_call);
+    RUN_TEST(dartlsp_cross_relative_bare_call);
+    RUN_TEST(dartlsp_cross_prefix_show_hide);
+    RUN_TEST(dartlsp_cross_reexport_bare_call);
+    RUN_TEST(dartlsp_cross_part_private_method);
+    RUN_TEST(dartlsp_cross_part_of_owner_private);
+    RUN_TEST(dartlsp_cross_regular_import_private_abstains);
+    RUN_TEST(dartlsp_cross_inherited_method_dispatch);
+    RUN_TEST(dartlsp_cross_return_type_chain);
+    RUN_TEST(dartlsp_cross_conditional_import_abstains);
+    RUN_TEST(dartlsp_cross_local_core_name_shadowing);
+    RUN_TEST(dartlsp_cross_static_method_receiver_kind);
+    RUN_TEST(dartlsp_cross_private_imported_base_member_abstains);
+    RUN_TEST(dartlsp_cross_hide_overflow_abstains);
+    RUN_TEST(dartlsp_cross_part_inherits_implicit_core);
+    RUN_TEST(dartlsp_cross_part_restricted_core_abstains);
+    RUN_TEST(dartlsp_cross_reexport_show_hide);
+    RUN_TEST(dartlsp_cross_part_external_package_collision_abstains);
+    RUN_TEST(dartlsp_cross_part_inherits_prefixed_filter);
 }

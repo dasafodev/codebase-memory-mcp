@@ -42,6 +42,16 @@
 /* True iff this language has a cbm_run_X_lsp_cross resolver wired up. */
 bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
 
+/* Build/free a per-file import map from graph IMPORTS edges. Dart keys use
+ * the original library URI and include one-level export targets; other
+ * languages retain local-name -> target-QN behavior. */
+int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
+                             const char *rel_path, CBMLanguage lang,
+                             CBMFileResult *const *result_cache,
+                             const cbm_file_info_t *files, int file_count,
+                             const char ***out_keys, const char ***out_vals, int *out_count);
+void cbm_pxc_free_import_map(const char **keys, const char **vals, int count);
+
 /* Collect a project-wide CBMLSPDef[] from every cached file result.
  * def_modules[i] receives the module QN for files[i] (malloc'd; the
  * caller frees each entry then the array). String fields in the
@@ -152,7 +162,7 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
  * NOTE: all_defs is read-only in practice but typed non-const to match
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *all_defs, int def_count,
+                     const char *module_qn, const char *rel_path, CBMLSPDef *all_defs, int def_count,
                      const char **imp_keys, const char **imp_vals, int imp_count);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */

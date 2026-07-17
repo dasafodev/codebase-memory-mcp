@@ -528,66 +528,45 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     }
 }
 
-/* Build import map from graph buffer IMPORTS edges (read-only access to gbuf). */
-static int build_import_map(const cbm_gbuf_t *gbuf, const char *project_name, const char *rel_path,
-                            const char ***out_keys, const char ***out_vals, int *out_count) {
+/* The Dart cross-LSP map may contain duplicate URI entries for re-exports and
+ * parts, plus reserved entries whose visibility is enforced from the AST.
+ * The generic name matcher cannot honor those combinators, so give it only
+ * the first ordinary target for each URI. Strings remain borrowed. */
+static int build_dart_generic_import_view(const char **keys, const char **vals, int count,
+                                          const char ***out_keys, const char ***out_vals) {
     *out_keys = NULL;
     *out_vals = NULL;
-    *out_count = 0;
-
-    char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(gbuf, file_qn);
-    free(file_qn);
-    if (!file_node) {
+    if (!keys || !vals || count <= 0) {
         return 0;
     }
-
-    const cbm_gbuf_edge_t **edges = NULL;
-    int edge_count = 0;
-    int rc =
-        cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges, &edge_count);
-    if (rc != 0 || edge_count == 0) {
+    const char **view_keys = (const char **)malloc((size_t)count * sizeof(*view_keys));
+    const char **view_vals = (const char **)malloc((size_t)count * sizeof(*view_vals));
+    if (!view_keys || !view_vals) {
+        free(view_keys);
+        free(view_vals);
         return 0;
     }
-
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
-    int count = 0;
-
-    for (int i = 0; i < edge_count; i++) {
-        const cbm_gbuf_edge_t *e = edges[i];
-        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, e->target_id);
-        if (!target || !e->properties_json) {
+    int kept = 0;
+    for (int i = 0; i < count; i++) {
+        if (!keys[i] || strncmp(keys[i], "@dart-", 6) == 0) {
             continue;
         }
-        const char *start = strstr(e->properties_json, "\"local_name\":\"");
-        if (start) {
-            start += strlen("\"local_name\":\"");
-            const char *end = strchr(start, '"');
-            if (end && end > start) {
-                keys[count] = cbm_strndup(start, end - start);
-                vals[count] = target->qualified_name;
-                count++;
+        bool duplicate = false;
+        for (int j = 0; j < kept; j++) {
+            if (strcmp(view_keys[j], keys[i]) == 0) {
+                duplicate = true;
+                break;
             }
         }
-    }
-
-    *out_keys = keys;
-    *out_vals = vals;
-    *out_count = count;
-    return 0;
-}
-
-static void free_import_map(const char **keys, const char **vals, int count) {
-    if (keys) {
-        for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
+        if (!duplicate) {
+            view_keys[kept] = keys[i];
+            view_vals[kept] = vals[i];
+            kept++;
         }
-        free((void *)keys);
     }
-    if (vals) {
-        free((void *)vals);
-    }
+    *out_keys = view_keys;
+    *out_vals = view_vals;
+    return kept;
 }
 
 /* True for languages whose module QN derives from the CONTAINING DIRECTORY
@@ -1298,10 +1277,21 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
+            char esc_local[CBM_SZ_256];
+            char esc_module[CBM_SZ_256];
+            char esc_kind[CBM_SZ_128];
+            char esc_details[CBM_SZ_2K];
+            cbm_json_escape(esc_local, sizeof(esc_local),
+                            imp->local_name ? imp->local_name : "");
+            cbm_json_escape(esc_module, sizeof(esc_module),
+                            imp->module_path ? imp->module_path : "");
+            cbm_json_escape(esc_kind, sizeof(esc_kind), imp->kind ? imp->kind : "");
+            cbm_json_escape(esc_details, sizeof(esc_details), imp->details ? imp->details : "");
+            char imp_props[CBM_SZ_4K];
+            snprintf(imp_props, sizeof(imp_props),
+                     "{\"local_name\":\"%s\",\"module_path\":\"%s\",\"kind\":\"%s\","
+                     "\"details\":\"%s\"}",
+                     esc_local, esc_module, esc_kind, esc_details);
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
             count++;
         }
@@ -2444,6 +2434,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
         ws->calls_resolved++;
     }
+    if (lang == CBM_LANG_DART) {
+        int direct = cbm_pipeline_materialize_dart_lsp_calls(
+            ws->local_edge_buf, rc->main_gbuf, rc->project_name, &result->resolved_calls);
+        ws->calls_resolved += direct;
+        ws->lsp_overrides += direct;
+    }
     if (lsp_idx) {
         cbm_ht_foreach(lsp_idx, lsp_idx_free_key, NULL);
         cbm_ht_free(lsp_idx);
@@ -2757,21 +2753,25 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * that exist in the AST. If the per-file extract found zero calls,
          * cross-LSP will too: the AST is the same. For non-JVM languages,
          * skip when per-file LSP already produced at least as many resolved
-         * entries as textual calls. Java/Kotlin per-file LSP can fill the
-         * count with constructors or same-file calls while a mixed-source-root
-         * Java↔Kotlin call remains unresolved, so JVM callers run whenever
-         * calls exist. */
-        bool jvm_cross_lsp = (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN);
+         * entries as textual calls. Java/Kotlin/Dart per-file LSP can fill the
+         * count with constructors or same-file calls while another call remains
+         * unresolved, so these callers run whenever calls exist. */
+        bool always_run_cross_lsp =
+            (lang == CBM_LANG_JAVA || lang == CBM_LANG_KOTLIN || lang == CBM_LANG_DART);
         bool cross_lsp_eligible =
             (rc->all_defs && rc->def_count > 0 && cbm_pxc_has_cross_lsp(lang) &&
              result->calls.count > 0 &&
-             (jvm_cross_lsp || result->resolved_calls.count < result->calls.count) &&
+             (always_run_cross_lsp || result->resolved_calls.count < result->calls.count) &&
              !is_generated);
+
+        bool has_direct_dart_lsp =
+            lang == CBM_LANG_DART &&
+            cbm_pipeline_has_dart_invocation_resolutions(&result->resolved_calls);
 
         /* Skip files with nothing else to resolve and no cross-LSP work. */
         if (result->calls.count == 0 && result->usages.count == 0 && result->throws.count == 0 &&
             result->rw.count == 0 && result->defs.count == 0 && result->impl_traits.count == 0 &&
-            !cross_lsp_eligible) {
+            !cross_lsp_eligible && !has_direct_dart_lsp) {
             continue;
         }
 
@@ -2782,7 +2782,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         const char **imp_vals = NULL;
         int imp_count = 0;
         uint64_t _imp_t0 = extract_now_ns();
-        build_import_map(rc->main_gbuf, rc->project_name, rel, &imp_keys, &imp_vals, &imp_count);
+        cbm_pxc_build_import_map(rc->main_gbuf, rc->project_name, rel, lang, rc->result_cache,
+                                 rc->files, rc->file_count, &imp_keys, &imp_vals, &imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_import_map, extract_now_ns() - _imp_t0,
                                   memory_order_relaxed);
 
@@ -2792,13 +2793,25 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
          * many call sites — first eval pays the strstr cost, repeats
          * are O(1) hash. Imports are constant within a file so the
          * cache is sound; invalidated at file exit. */
+        const char **resolve_imp_keys = imp_keys;
+        const char **resolve_imp_vals = imp_vals;
+        int resolve_imp_count = imp_count;
+        const char **dart_view_keys = NULL;
+        const char **dart_view_vals = NULL;
+        if (lang == CBM_LANG_DART) {
+            resolve_imp_count = build_dart_generic_import_view(
+                imp_keys, imp_vals, imp_count, &dart_view_keys, &dart_view_vals);
+            resolve_imp_keys = dart_view_keys;
+            resolve_imp_vals = dart_view_vals;
+        }
+
         cbm_registry_reach_cache_begin(result->calls.count + result->usages.count + 64);
 
         /* Per-file import-map prefix → module-qn hash. resolve_import_map
          * was doing O(imports) linear strcmp per call; with this it
          * becomes O(1). Keys/values borrowed from imp_keys/imp_vals
          * which outlive this scope. */
-        cbm_registry_import_map_cache_begin(imp_keys, imp_vals, imp_count);
+        cbm_registry_import_map_cache_begin(resolve_imp_keys, resolve_imp_vals, resolve_imp_count);
 
         /* THE BIG ONE: per-file cache of cbm_registry_resolve results.
          * Same callee_name in multiple call sites resolves identically
@@ -2892,30 +2905,35 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
 
         /* ── CALLS resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_calls(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count, lang);
+        resolve_file_calls(rc, ws, result, rel, module_qn, resolve_imp_keys, resolve_imp_vals,
+                           resolve_imp_count, lang);
         atomic_fetch_add_explicit(&rc->time_ns_calls, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
         /* ── USAGE resolution ──────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_usages(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_usages(rc, ws, result, rel, module_qn, resolve_imp_keys, resolve_imp_vals,
+                            resolve_imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_usages, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
         /* ── THROWS / RAISES ───────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_throws(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_throws(rc, ws, result, rel, module_qn, resolve_imp_keys, resolve_imp_vals,
+                            resolve_imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_throws, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
         /* ── READS / WRITES ────────────────────────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_rw(rc, ws, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_rw(rc, ws, result, rel, module_qn, resolve_imp_keys, resolve_imp_vals,
+                        resolve_imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_rw, extract_now_ns() - _ph_t0, memory_order_relaxed);
 
         /* ── INHERITS + DECORATES + IMPLEMENTS ──────────────────── */
         _ph_t0 = extract_now_ns();
-        resolve_file_semantic(rc, ws, result, module_qn, imp_keys, imp_vals, imp_count);
+        resolve_file_semantic(rc, ws, result, module_qn, resolve_imp_keys, resolve_imp_vals,
+                              resolve_imp_count);
         atomic_fetch_add_explicit(&rc->time_ns_semantic, extract_now_ns() - _ph_t0,
                                   memory_order_relaxed);
 
@@ -2924,7 +2942,9 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
         cbm_registry_resolve_cache_end();
 
         free(module_qn);
-        free_import_map(imp_keys, imp_vals, imp_count);
+        free((void *)dart_view_keys);
+        free((void *)dart_view_vals);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
 
         atomic_fetch_add_explicit(&rc->time_ns_total_loop, extract_now_ns() - _loop_t0,
                                   memory_order_relaxed);

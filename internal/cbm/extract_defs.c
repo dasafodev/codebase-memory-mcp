@@ -4412,6 +4412,22 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
     return null_node;
 }
 
+static bool dart_node_has_token(TSNode node, const char *token, int depth) {
+    if (ts_node_is_null(node) || depth < 0) {
+        return false;
+    }
+    if (strcmp(ts_node_type(node), token) == 0) {
+        return true;
+    }
+    uint32_t count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        if (dart_node_has_token(ts_node_child(node, i), token, depth - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // Push a single method definition
 static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
                             const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
@@ -4435,6 +4451,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     def.end_line = ts_node_end_point(child).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_DART) {
+        def.callable_flags = CBM_DEF_CALLABLE_KNOWN;
+        if (dart_node_has_token(child, "static", 4)) {
+            def.callable_flags |= CBM_DEF_CALLABLE_STATIC;
+        }
+    }
 
     TSNode params = ts_node_child_by_field_name(child, TS_FIELD("parameters"));
     // ObjectScript exposes the parameter list under a `parameter_list` field.

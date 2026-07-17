@@ -165,9 +165,12 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
              * resolved callee_qn's short name. A function-pointer / DLL call's
              * callee is the pointer name (`fp`); a C++ destructor's only textual
              * anchor is the deleted operand (`p`, vs. the `T.~T` callee QN). In
-             * both the LSP stashed the original textual name in `reason`. Match
-             * the call site on that name, gated to those strategies so `reason`
-             * is never misread as an unresolved-call diagnostic. */
+         * both the LSP stashed the original textual name in `reason`. Match
+         * the call site on that name, gated to those strategies so `reason`
+         * is never misread as an unresolved-call diagnostic. Dart's selector
+         * grammar also makes the syntactic call extractor retain an import
+         * prefix (`api` in `api.load()`); the Dart resolver records that exact
+         * prefix in `reason` for its import and prefixed-constructor strategies. */
             if (!(rc->reason && rc->strategy &&
                   (strcmp(rc->strategy, "lsp_func_ptr") == 0 ||
                    strcmp(rc->strategy, "lsp_dll_resolve") == 0 ||
@@ -175,6 +178,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
                    strcmp(rc->strategy, "lsp_method_ref_ctor_synth") == 0 ||
                    strcmp(rc->strategy, "lsp_dict_dispatch") == 0 ||
                    strcmp(rc->strategy, "lsp_destructor") == 0 ||
+                   strcmp(rc->strategy, "lsp_dart_import") == 0 ||
+                   strcmp(rc->strategy, "lsp_dart_constructor") == 0 ||
                    strcmp(rc->strategy, "php_method_dynamic") == 0) &&
                   strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0)) {
                 continue;
@@ -294,6 +299,97 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node(const cbm_gbuf
         match = cand;
     }
     return match;
+}
+
+/* Dart's grammar represents an expression such as `a.make().ping()` as a
+ * base expression followed by flat selector siblings. The semantic pass can
+ * therefore resolve invocations that have no standalone CBMCall for the
+ * generic (caller, textual-callee) join. These are the Dart strategies that
+ * denote an actual invocation. Getter strategies are deliberately excluded:
+ * a property read is not a CALLS edge. */
+static inline bool cbm_pipeline_is_dart_invocation_resolution(const CBMResolvedCall *rc) {
+    if (!rc || !rc->strategy || rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        return false;
+    }
+    return strcmp(rc->strategy, "lsp_dart_constructor") == 0 ||
+           strcmp(rc->strategy, "lsp_dart_import") == 0 ||
+           strcmp(rc->strategy, "lsp_dart_method") == 0 ||
+           strcmp(rc->strategy, "lsp_dart_static") == 0 ||
+           strcmp(rc->strategy, "lsp_dart_super") == 0 ||
+           strcmp(rc->strategy, "lsp_dart_this") == 0 ||
+           strcmp(rc->strategy, "lsp_dart_top_level") == 0;
+}
+
+static inline bool
+cbm_pipeline_has_dart_invocation_resolutions(const CBMResolvedCallArray *resolved_calls) {
+    if (!resolved_calls) {
+        return false;
+    }
+    for (int i = 0; i < resolved_calls->count; i++) {
+        if (cbm_pipeline_is_dart_invocation_resolution(&resolved_calls->items[i])) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static inline bool cbm_pipeline_has_call_edge(const cbm_gbuf_t *gbuf, int64_t source_id,
+                                               int64_t target_id) {
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!gbuf || cbm_gbuf_find_edges_by_source_type(gbuf, source_id, "CALLS", &edges,
+                                                     &edge_count) != 0) {
+        return false;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i] && edges[i]->target_id == target_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Materialize invocation-shaped Dart resolutions that could not participate
+ * in the normal textual-call join. Both graph nodes must exist exactly (with
+ * the standard project-prefix retry), which keeps SDK/package seeds out of
+ * the project graph and preserves the no-false-edge policy. Existing CALLS
+ * edges are left untouched so their call-site line/argument properties win.
+ * `edge_gbuf` is the main buffer in the sequential pipeline and a worker-local
+ * edge buffer in the parallel pipeline; node lookup always uses `node_gbuf`. */
+static inline int cbm_pipeline_materialize_dart_lsp_calls(
+    cbm_gbuf_t *edge_gbuf, const cbm_gbuf_t *node_gbuf, const char *project_name,
+    const CBMResolvedCallArray *resolved_calls) {
+    if (!edge_gbuf || !node_gbuf || !resolved_calls) {
+        return 0;
+    }
+
+    int emitted = 0;
+    for (int i = 0; i < resolved_calls->count; i++) {
+        const CBMResolvedCall *rc = &resolved_calls->items[i];
+        if (!cbm_pipeline_is_dart_invocation_resolution(rc) || !rc->caller_qn ||
+            !rc->callee_qn) {
+            continue;
+        }
+        const cbm_gbuf_node_t *source =
+            cbm_pipeline_lsp_target_node(node_gbuf, project_name, rc->caller_qn, false);
+        const cbm_gbuf_node_t *target =
+            cbm_pipeline_lsp_target_node(node_gbuf, project_name, rc->callee_qn, false);
+        if (!source || !target || source->id == target->id ||
+            cbm_pipeline_has_call_edge(edge_gbuf, source->id, target->id)) {
+            continue;
+        }
+
+        const char *callee = cbm_lsp_bare_segment(rc->callee_qn);
+        char props[CBM_SZ_512];
+        snprintf(props, sizeof(props),
+                 "{\"callee\":\"%s\",\"confidence\":%.2f,\"strategy\":\"%s\","
+                 "\"candidates\":1}",
+                 callee ? callee : "", (double)rc->confidence, rc->strategy);
+        if (cbm_gbuf_insert_edge(edge_gbuf, source->id, target->id, "CALLS", props) != 0) {
+            emitted++;
+        }
+    }
+    return emitted;
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

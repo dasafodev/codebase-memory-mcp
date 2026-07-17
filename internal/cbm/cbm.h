@@ -179,6 +179,15 @@ typedef enum {
 
 // --- Extraction result structs ---
 
+/* Callable metadata carried from syntax extraction into light-semantic
+ * cross-file registries. KNOWN distinguishes an ordinary instance method
+ * from legacy/hand-built definitions that do not describe their modifiers. */
+#define CBM_DEF_CALLABLE_KNOWN (1u << 0)
+#define CBM_DEF_CALLABLE_STATIC (1u << 1)
+#define CBM_DEF_CALLABLE_CONSTRUCTOR (1u << 2)
+#define CBM_DEF_CALLABLE_GETTER (1u << 3)
+#define CBM_DEF_CALLABLE_SETTER (1u << 4)
+
 typedef struct {
     const char *name;           // short name
     const char *qualified_name; // project.path.name
@@ -216,6 +225,7 @@ typedef struct {
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    uint32_t callable_flags; // CBM_DEF_CALLABLE_* metadata for methods/accessors
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
 } CBMDefinition;
@@ -248,6 +258,8 @@ typedef struct {
 typedef struct {
     const char *local_name;  // local alias or name
     const char *module_path; // resolved module path / QN
+    const char *kind;        // optional language-specific kind (Dart: import/export/part/part_of)
+    const char *details;     // optional compact language-specific directive metadata
 } CBMImport;
 
 typedef struct {

@@ -760,7 +760,10 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             continue;
         }
 
-        if (result->calls.count == 0) {
+        bool has_direct_dart_lsp =
+            files[i].language == CBM_LANG_DART &&
+            cbm_pipeline_has_dart_invocation_resolutions(&result->resolved_calls);
+        if (result->calls.count == 0 && !has_direct_dart_lsp) {
             if (result_owned) {
                 cbm_free_result(result);
             }
@@ -791,6 +794,13 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
             } else {
                 unresolved++;
             }
+        }
+
+        if (files[i].language == CBM_LANG_DART) {
+            int direct = cbm_pipeline_materialize_dart_lsp_calls(
+                ctx->gbuf, ctx->gbuf, ctx->project_name, &result->resolved_calls);
+            total_calls += direct;
+            resolved += direct;
         }
 
         free(module_qn);

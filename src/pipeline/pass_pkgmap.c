@@ -1118,6 +1118,53 @@ static char *resolve_backslash_prefix(CBMHashTable *map, const char *module_path
     return NULL;
 }
 
+/* Resolve a Dart package URI through the pubspec-derived package map.
+ * `parse_pubspec_yaml` records package-name -> <project>.path.to.lib; append
+ * the URI path below lib while preserving dotted generated-file stems
+ * (`model.g.dart` -> `model.g`). */
+static char *resolve_dart_package_uri(CBMHashTable *map, const char *module_path) {
+    static const char prefix[] = "package:";
+    if (!map || !module_path || strncmp(module_path, prefix, sizeof(prefix) - 1) != 0) {
+        return NULL;
+    }
+    const char *package_start = module_path + sizeof(prefix) - 1;
+    const char *slash = strchr(package_start, '/');
+    if (!slash || slash == package_start || !slash[1]) {
+        return NULL;
+    }
+    char *package_name = cbm_strndup(package_start, (size_t)(slash - package_start));
+    if (!package_name) {
+        return NULL;
+    }
+    const char *base_qn = (const char *)cbm_ht_get(map, package_name);
+    free(package_name);
+    if (!base_qn) {
+        return NULL;
+    }
+
+    const char *path = slash + 1;
+    size_t path_len = strlen(path);
+    if (path_len > 5 && strcmp(path + path_len - 5, ".dart") == 0) {
+        path_len -= 5;
+    }
+    size_t base_len = strlen(base_qn);
+    char *result = (char *)malloc(base_len + 1 + path_len + 1);
+    if (!result) {
+        return NULL;
+    }
+    memcpy(result, base_qn, base_len);
+    result[base_len] = '.';
+    for (size_t i = 0; i < path_len; i++) {
+        char c = path[i];
+        if (c == '/' || c == '\\') {
+            c = '.';
+        }
+        result[base_len + 1 + i] = c;
+    }
+    result[base_len + 1 + path_len] = '\0';
+    return result;
+}
+
 char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *source_rel,
                                   const char *module_path) {
     if (!ctx || !module_path) {
@@ -1151,6 +1198,14 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
     if (!pkgmap) {
         return cbm_pipeline_fqn_module(ctx->project_name, module_path);
+    }
+
+    /* Dart package URIs have a scheme prefix that generic slash-prefix
+     * matching cannot see. Reuse the pubspec entry rather than reparsing the
+     * manifest here. */
+    char *dart_package = resolve_dart_package_uri(pkgmap, module_path);
+    if (dart_package) {
+        return dart_package;
     }
 
     /* 3. Exact lookup */
@@ -1492,6 +1547,81 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+/* Dart non-scheme URIs are exact paths relative to the importing file. Keep
+ * this separate from resolve_sibling_file(): that helper intentionally tries
+ * SCSS partial, Meson-directory, and basename fallbacks which are invalid for
+ * Dart and can turn a missing nested URI into an unrelated sibling import. */
+static const cbm_gbuf_node_t *resolve_dart_relative_file(const cbm_pipeline_ctx_t *ctx,
+                                                         const char *source_rel,
+                                                         const char *source_file_qn,
+                                                         const char *module_path) {
+    if (!ctx || !source_rel || !module_path || !module_path[0] || module_path[0] == '/') {
+        return NULL;
+    }
+    char *dir = path_dirname(source_rel);
+    if (!dir) {
+        return NULL;
+    }
+    char joined[PKGMAP_PATH_BUF];
+    int joined_len = snprintf(joined, sizeof(joined), "%s%s%s", dir, dir[0] ? "/" : "",
+                              module_path);
+    free(dir);
+    if (joined_len <= 0 || (size_t)joined_len >= sizeof(joined)) {
+        return NULL;
+    }
+
+    char normalized[PKGMAP_PATH_BUF];
+    size_t out_len = 0;
+    const char *p = joined;
+    while (*p) {
+        while (*p == '/') {
+            p++;
+        }
+        const char *segment = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        size_t segment_len = (size_t)(p - segment);
+        if (segment_len == 0 || (segment_len == 1 && segment[0] == '.')) {
+            continue;
+        }
+        if (segment_len == 2 && segment[0] == '.' && segment[1] == '.') {
+            if (out_len == 0) {
+                return NULL; /* URI escapes the indexed repository root */
+            }
+            while (out_len > 0 && normalized[out_len - 1] != '/') {
+                out_len--;
+            }
+            if (out_len > 0) {
+                out_len--;
+            }
+            continue;
+        }
+        size_t separator = out_len > 0 ? 1u : 0u;
+        if (out_len + separator + segment_len >= sizeof(normalized)) {
+            return NULL;
+        }
+        if (separator) {
+            normalized[out_len++] = '/';
+        }
+        memcpy(normalized + out_len, segment, segment_len);
+        out_len += segment_len;
+    }
+    if (out_len == 0) {
+        return NULL;
+    }
+    normalized[out_len] = '\0';
+    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, normalized, "__file__");
+    const cbm_gbuf_node_t *target = file_qn ? cbm_gbuf_find_by_qn(ctx->gbuf, file_qn) : NULL;
+    free(file_qn);
+    if (!target || !target->label || !import_targetable_label(target->label) ||
+        (source_file_qn && target->qualified_name &&
+         strcmp(target->qualified_name, source_file_qn) == 0)) {
+        return NULL;
+    }
+    return target;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
@@ -1499,6 +1629,46 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                                                         CBMHashTable *namespace_map) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
+    }
+
+    if (imp->kind && (strcmp(imp->kind, "import_conditional") == 0 ||
+                      strcmp(imp->kind, "export_conditional") == 0)) {
+        return NULL;
+    }
+
+    /* Dart SDK libraries are registry seeds, never project graph imports.
+     * Likewise an external package: URI without a pubspec-derived mapping
+     * must remain external. Letting either continue into the generic
+     * basename/symbol fallbacks can attach `dart:convert` to a local `convert`
+     * node or `package:http/...` to an unrelated `http` declaration. */
+    if (strncmp(imp->module_path, "dart:", 5) == 0) {
+        return NULL;
+    }
+    if (strncmp(imp->module_path, "package:", 8) == 0) {
+        const char *name = imp->module_path + 8;
+        const char *slash = strchr(name, '/');
+        CBMHashTable *pkgmap = cbm_pipeline_get_pkgmap();
+        if (!slash || slash == name || !pkgmap) {
+            return NULL;
+        }
+        char package_name[PKGMAP_PATH_BUF];
+        size_t package_len = (size_t)(slash - name);
+        if (package_len >= sizeof(package_name)) {
+            return NULL;
+        }
+        memcpy(package_name, name, package_len);
+        package_name[package_len] = '\0';
+        if (!cbm_ht_has(pkgmap, package_name)) {
+            return NULL;
+        }
+    }
+
+    /* Every non-scheme Dart URI is relative to the containing library file.
+     * Try that exact location first and stop if it is absent; the generic
+     * project-root module fallback can otherwise bind a nested import to an
+     * unrelated root-level file with the same basename. */
+    if (imp->kind && !strchr(imp->module_path, ':')) {
+        return resolve_dart_relative_file(ctx, source_rel, source_file_qn, imp->module_path);
     }
 
     /* Prefer exact header-file nodes for C/C++ includes so same-stem source or
@@ -1532,6 +1702,14 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         if (sib) {
             return sib;
         }
+    }
+
+    /* Dart directives have file/URI semantics, never symbol-name semantics.
+     * `kind` is populated only by the Dart extractor, so an unresolved Dart
+     * path must stop here instead of drifting into namespace/symbol fallbacks
+     * and fabricating an IMPORTS edge to a same-named declaration. */
+    if (imp->kind) {
+        return NULL;
     }
 
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,

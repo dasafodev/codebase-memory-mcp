@@ -680,7 +680,27 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
          * deterministically, because intra-file arrival order is fixed. A
          * full tie is the same entity re-upserted → refresh in place.
          * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+        /* A real file beats a placeholder. Synthetic nodes carry an empty
+         * file_path — most notably a Route created from a client/test call site,
+         * which has no source location. The content rule below sorts by SMALLEST
+         * file_path, and "" is smaller than every real path, so without this guard
+         * a fileless call-site Route would win the tiebreak and demote a
+         * decorator-declared handler (file = its controller) to a fileless
+         * phantom whenever the two share a canonical route QN — e.g. a NestJS
+         * `@Get('routes')` handler clobbered by a supertest `.get('/internal/
+         * routes')`. Static-path handlers collide this way; parameterized ones
+         * escape only because concrete call URLs canonicalize to a different QN
+         * than the "{}" pattern. Empty-vs-empty and set-vs-set fall through to the
+         * content rule, so the pick stays a commutative, scheduling-free total
+         * order. */
+        bool new_no_file = (file_path == NULL || file_path[0] == '\0');
+        bool old_no_file = (existing->file_path == NULL || existing->file_path[0] == '\0');
+        int c;
+        if (new_no_file != old_no_file) {
+            c = new_no_file ? 1 : -1; /* the candidate WITH a file wins */
+        } else {
+            c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
+        }
         if (c == 0) {
             c = existing->start_line - start_line;
         }

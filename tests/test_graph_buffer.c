@@ -466,6 +466,44 @@ TEST(gbuf_upsert_same_qn_updates_all_fields) {
     PASS();
 }
 
+/* A same-QN node that carries a real file_path must win over a fileless
+ * placeholder regardless of arrival order. Regression for decorator route
+ * handlers (file = their controller) being demoted to fileless phantoms when a
+ * client/test call site produced the same canonical Route QN with file="".
+ * "" sorts smaller than any real path, so the old strcmp tiebreak handed the win
+ * to the placeholder. Both orders must land on the node WITH the file. */
+TEST(gbuf_upsert_real_file_beats_empty) {
+    /* placeholder first, real handler second */
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(gb, "Route", "/internal/routes", "__route__GET__/internal/routes", "", 0, 0,
+                         "{\"method\":\"GET\"}");
+    cbm_gbuf_upsert_node(gb, "Route", "/internal/routes", "__route__GET__/internal/routes",
+                         "src/internal/internal.controller.ts", 0, 0,
+                         "{\"method\":\"GET\",\"source\":\"decorator\"}");
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
+    const cbm_gbuf_node_t *n =
+        cbm_gbuf_find_by_qn(gb, "__route__GET__/internal/routes");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->file_path, "src/internal/internal.controller.ts");
+    ASSERT_STR_EQ(n->properties_json, "{\"method\":\"GET\",\"source\":\"decorator\"}");
+    cbm_gbuf_free(gb);
+
+    /* real handler first, placeholder second — commutative: same survivor */
+    gb = cbm_gbuf_new("test", "/tmp");
+    cbm_gbuf_upsert_node(gb, "Route", "/internal/routes", "__route__GET__/internal/routes",
+                         "src/internal/internal.controller.ts", 0, 0,
+                         "{\"method\":\"GET\",\"source\":\"decorator\"}");
+    cbm_gbuf_upsert_node(gb, "Route", "/internal/routes", "__route__GET__/internal/routes", "", 0, 0,
+                         "{\"method\":\"GET\"}");
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 1);
+    n = cbm_gbuf_find_by_qn(gb, "__route__GET__/internal/routes");
+    ASSERT_NOT_NULL(n);
+    ASSERT_STR_EQ(n->file_path, "src/internal/internal.controller.ts");
+    ASSERT_STR_EQ(n->properties_json, "{\"method\":\"GET\",\"source\":\"decorator\"}");
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_upsert_long_qn) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
 
@@ -1037,6 +1075,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_upsert_null_qn);
     RUN_TEST(gbuf_upsert_empty_qn);
     RUN_TEST(gbuf_upsert_same_qn_updates_all_fields);
+    RUN_TEST(gbuf_upsert_real_file_beats_empty);
     RUN_TEST(gbuf_upsert_long_qn);
     RUN_TEST(gbuf_find_by_qn_missing);
     RUN_TEST(gbuf_find_by_id_missing);

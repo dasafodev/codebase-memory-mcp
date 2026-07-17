@@ -165,9 +165,12 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
              * resolved callee_qn's short name. A function-pointer / DLL call's
              * callee is the pointer name (`fp`); a C++ destructor's only textual
              * anchor is the deleted operand (`p`, vs. the `T.~T` callee QN). In
-             * both the LSP stashed the original textual name in `reason`. Match
-             * the call site on that name, gated to those strategies so `reason`
-             * is never misread as an unresolved-call diagnostic. */
+         * both the LSP stashed the original textual name in `reason`. Match
+         * the call site on that name, gated to those strategies so `reason`
+         * is never misread as an unresolved-call diagnostic. Dart's selector
+         * grammar also makes the syntactic call extractor retain an import
+         * prefix (`api` in `api.load()`); the Dart resolver records that exact
+         * prefix in `reason` for its import and prefixed-constructor strategies. */
             if (!(rc->reason && rc->strategy &&
                   (strcmp(rc->strategy, "lsp_func_ptr") == 0 ||
                    strcmp(rc->strategy, "lsp_dll_resolve") == 0 ||
@@ -175,6 +178,8 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution(
                    strcmp(rc->strategy, "lsp_method_ref_ctor_synth") == 0 ||
                    strcmp(rc->strategy, "lsp_dict_dispatch") == 0 ||
                    strcmp(rc->strategy, "lsp_destructor") == 0 ||
+                   strcmp(rc->strategy, "lsp_dart_import") == 0 ||
+                   strcmp(rc->strategy, "lsp_dart_constructor") == 0 ||
                    strcmp(rc->strategy, "php_method_dynamic") == 0) &&
                   strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0)) {
                 continue;

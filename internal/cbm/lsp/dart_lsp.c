@@ -10,9 +10,16 @@
 
 #define DART_EVAL_MAX_DEPTH 40
 #define DART_IMPORT_INITIAL_CAP 8
+#define DART_LIBRARY_INITIAL_CAP 4
 #define DART_FIELD_INITIAL_CAP 16
 #define DART_NAME_LIST_MAX 64
 #define TS_FIELD(name) name, (uint32_t)(sizeof(name) - 1)
+#define DART_CROSS_PART_IMPORT_PREFIX "@dart-part-import:"
+#define DART_CROSS_PART_FILTER_PREFIX "@dart-part-filter:"
+#define DART_CROSS_PART_CORE_BLOCKED "@dart-part-core-blocked"
+#define DART_CROSS_RESTRICTED_PREFIX "@dart-restricted:"
+#define DART_CROSS_EXPORT_FILTER_PREFIX "@dart-export-filter:"
+#define DART_CROSS_EXTERNAL_MODULE_PREFIX "@dart-external-module:"
 
 #define DART_CONF_CONSTRUCTOR 0.95f
 #define DART_CONF_TOP_LEVEL 0.95f
@@ -24,6 +31,10 @@
 static void dart_walk_node(DartLSPContext *ctx, TSNode node);
 static void dart_process_block(DartLSPContext *ctx, TSNode block, bool push_scope);
 static const CBMType *dart_eval_chain(DartLSPContext *ctx, TSNode container);
+static void dart_add_import(DartLSPContext *ctx, CBMDartImport import);
+static bool dart_name_in(const char **names, int count, const char *name);
+
+extern const TSLanguage *tree_sitter_dart(void);
 
 static bool dart_is(TSNode node, const char *kind) {
     return !ts_node_is_null(node) && strcmp(ts_node_type(node), kind) == 0;
@@ -78,6 +89,18 @@ static TSNode dart_find_kind(TSNode node, const char *kind, int depth) {
     return none;
 }
 
+static int dart_count_kind(TSNode node, const char *kind, int depth, int limit) {
+    if (ts_node_is_null(node) || depth < 0 || limit <= 0) {
+        return 0;
+    }
+    int count = strcmp(ts_node_type(node), kind) == 0 ? 1 : 0;
+    uint32_t children = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < children && count < limit; i++) {
+        count += dart_count_kind(ts_node_named_child(node, i), kind, depth - 1, limit - count);
+    }
+    return count;
+}
+
 static bool dart_has_token(TSNode node, const char *kind, int depth) {
     if (ts_node_is_null(node) || depth < 0) {
         return false;
@@ -123,6 +146,71 @@ static const char *dart_join(CBMArena *arena, const char *left, const char *righ
 static const char *dart_short(const char *qn) {
     const char *dot = qn ? strrchr(qn, '.') : NULL;
     return dot ? dot + 1 : qn;
+}
+
+static bool dart_module_in_library(const DartLSPContext *ctx, const char *module_qn) {
+    if (!ctx || !module_qn) {
+        return false;
+    }
+    for (int i = 0; i < ctx->library_module_count; i++) {
+        if (ctx->library_modules[i] && strcmp(ctx->library_modules[i], module_qn) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void dart_add_library_module(DartLSPContext *ctx, const char *module_qn) {
+    if (!ctx || !module_qn || !module_qn[0] || dart_module_in_library(ctx, module_qn)) {
+        return;
+    }
+    if (ctx->library_module_count >= ctx->library_module_cap) {
+        int cap = ctx->library_module_cap > 0 ? ctx->library_module_cap * 2
+                                             : DART_LIBRARY_INITIAL_CAP;
+        const char **items =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(*items));
+        if (!items) {
+            return;
+        }
+        if (ctx->library_modules && ctx->library_module_count > 0) {
+            memcpy(items, ctx->library_modules,
+                   (size_t)ctx->library_module_count * sizeof(*items));
+        }
+        ctx->library_modules = items;
+        ctx->library_module_cap = cap;
+    }
+    ctx->library_modules[ctx->library_module_count++] =
+        cbm_arena_strdup(ctx->arena, module_qn);
+}
+
+static const char *dart_type_def_module(const DartLSPContext *ctx, const char *type_qn) {
+    if (!ctx || !type_qn) {
+        return NULL;
+    }
+    for (int i = 0; i < ctx->cross_def_count; i++) {
+        const CBMLSPDef *def = &ctx->cross_defs[i];
+        if (def->qualified_name && def->def_module_qn &&
+            strcmp(def->qualified_name, type_qn) == 0) {
+            return def->def_module_qn;
+        }
+    }
+    for (int i = 0; i < ctx->library_module_count; i++) {
+        const char *module = ctx->library_modules[i];
+        size_t len = module ? strlen(module) : 0;
+        if (len > 0 && strncmp(type_qn, module, len) == 0 && type_qn[len] == '.' &&
+            !strchr(type_qn + len + 1, '.')) {
+            return module;
+        }
+    }
+    return NULL;
+}
+
+static bool dart_private_member_allowed(const DartLSPContext *ctx, const char *receiver_qn,
+                                        const char *member) {
+    if (!member || member[0] != '_') {
+        return true;
+    }
+    return dart_module_in_library(ctx, dart_type_def_module(ctx, receiver_qn));
 }
 
 static const char *dart_type_qn(const CBMType *type) {
@@ -185,8 +273,9 @@ static void dart_register_default_constructor(CBMTypeRegistry *registry, CBMAren
     cbm_registry_add_func(registry, func);
 }
 
-static void dart_emit(DartLSPContext *ctx, const char *callee_qn, const char *strategy,
-                      float confidence) {
+static void dart_emit_with_reason(DartLSPContext *ctx, const char *callee_qn,
+                                  const char *strategy, float confidence,
+                                  const char *reason) {
     if (!ctx || !ctx->resolved_calls || !ctx->enclosing_func_qn || !callee_qn ||
         confidence < 0.60f) {
         return;
@@ -196,11 +285,17 @@ static void dart_emit(DartLSPContext *ctx, const char *callee_qn, const char *st
     rc.callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
     rc.strategy = strategy;
     rc.confidence = confidence;
+    rc.reason = reason ? cbm_arena_strdup(ctx->arena, reason) : NULL;
     cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
     if (ctx->debug) {
         fprintf(stderr, "[dart_lsp] %s -> %s [%s %.2f]\n", ctx->enclosing_func_qn, callee_qn,
                 strategy, (double)confidence);
     }
+}
+
+static void dart_emit(DartLSPContext *ctx, const char *callee_qn, const char *strategy,
+                      float confidence) {
+    dart_emit_with_reason(ctx, callee_qn, strategy, confidence, NULL);
 }
 
 void dart_lsp_init(DartLSPContext *ctx, CBMArena *arena, const char *source, int source_len,
@@ -219,9 +314,22 @@ void dart_lsp_init(DartLSPContext *ctx, CBMArena *arena, const char *source, int
     ctx->import_cap = DART_IMPORT_INITIAL_CAP;
     ctx->imports =
         (CBMDartImport *)cbm_arena_alloc(arena, (size_t)ctx->import_cap * sizeof(CBMDartImport));
+    if (!ctx->imports) {
+        ctx->import_cap = 0;
+    }
+    ctx->library_module_cap = DART_LIBRARY_INITIAL_CAP;
+    ctx->library_modules = (const char **)cbm_arena_alloc(
+        arena, (size_t)ctx->library_module_cap * sizeof(*ctx->library_modules));
+    if (!ctx->library_modules) {
+        ctx->library_module_cap = 0;
+    }
+    dart_add_library_module(ctx, ctx->module_qn);
     ctx->field_cap = DART_FIELD_INITIAL_CAP;
     ctx->fields =
         (CBMDartFieldInfo *)cbm_arena_alloc(arena, (size_t)ctx->field_cap * sizeof(*ctx->fields));
+    if (!ctx->fields) {
+        ctx->field_cap = 0;
+    }
     ctx->debug = getenv("CBM_LSP_DEBUG") != NULL;
 }
 
@@ -354,6 +462,230 @@ static const char *dart_uri_module(DartLSPContext *ctx, const char *uri) {
     return cbm_fqn_module(ctx->arena, ctx->project_name, joined);
 }
 
+static const char *dart_uri_text(DartLSPContext *ctx, const char *quoted) {
+    if (!ctx || !quoted) {
+        return NULL;
+    }
+    size_t len = strlen(quoted);
+    const char *start = quoted;
+    if (len >= 2 && ((quoted[0] == '\'' && quoted[len - 1] == '\'') ||
+                     (quoted[0] == '"' && quoted[len - 1] == '"'))) {
+        start++;
+        len -= 2;
+    }
+    return cbm_arena_strndup(ctx->arena, start, len);
+}
+
+static void dart_merge_export_filter(DartLSPContext *ctx, CBMDartImport *import,
+                                     const char *details, size_t details_len) {
+    if (!ctx || !import || !details || details_len == 0) {
+        if (import) {
+            import->unusable = true;
+        }
+        return;
+    }
+    const char *shows[DART_NAME_LIST_MAX];
+    const char *hides[DART_NAME_LIST_MAX];
+    int show_count = 0;
+    int hide_count = 0;
+    bool seen_show = false;
+    bool seen_prefix = false;
+    const char *p = details;
+    const char *end = details + details_len;
+    while (p < end) {
+        char marker = *p++;
+        if ((marker != 'S' && marker != 'H' && marker != 'P') || p >= end || *p++ != ':') {
+            import->unusable = true;
+            return;
+        }
+        const char *segment_names[DART_NAME_LIST_MAX];
+        int segment_count = 0;
+        bool have_name = false;
+        while (p < end && *p != ';') {
+            const char *name = p;
+            while (p < end && *p != ',' && *p != ';') {
+                p++;
+            }
+            size_t name_len = (size_t)(p - name);
+            if (name_len == 0) {
+                import->unusable = true;
+                return;
+            }
+            const char *copy = cbm_arena_strndup(ctx->arena, name, name_len);
+            if (!copy) {
+                import->unusable = true;
+                return;
+            }
+            if (segment_count >= DART_NAME_LIST_MAX) {
+                import->unusable = true;
+                return;
+            }
+            segment_names[segment_count++] = copy;
+            have_name = true;
+            if (p < end && *p == ',') {
+                p++;
+            }
+        }
+        if (!have_name || p >= end || *p++ != ';') {
+            import->unusable = true;
+            return;
+        }
+        if (marker == 'P') {
+            if (seen_prefix || segment_count != 1 || import->prefix) {
+                import->unusable = true;
+                return;
+            }
+            import->prefix = segment_names[0];
+            seen_prefix = true;
+        } else if (marker == 'S') {
+            if (!seen_show) {
+                memcpy(shows, segment_names, (size_t)segment_count * sizeof(*shows));
+                show_count = segment_count;
+                seen_show = true;
+            } else {
+                int intersection_count = 0;
+                for (int i = 0; i < show_count; i++) {
+                    if (dart_name_in(segment_names, segment_count, shows[i])) {
+                        shows[intersection_count++] = shows[i];
+                    }
+                }
+                show_count = intersection_count;
+                if (show_count == 0) {
+                    import->unusable = true;
+                    return;
+                }
+            }
+        } else {
+            for (int i = 0; i < segment_count; i++) {
+                if (!dart_name_in(hides, hide_count, segment_names[i])) {
+                    if (hide_count >= DART_NAME_LIST_MAX) {
+                        import->unusable = true;
+                        return;
+                    }
+                    hides[hide_count++] = segment_names[i];
+                }
+            }
+        }
+    }
+
+    if (show_count > 0) {
+        const char *merged[DART_NAME_LIST_MAX];
+        int merged_count = 0;
+        if (import->show_count > 0) {
+            for (int i = 0; i < import->show_count; i++) {
+                if (dart_name_in(shows, show_count, import->show_names[i])) {
+                    merged[merged_count++] = import->show_names[i];
+                }
+            }
+            if (merged_count == 0) {
+                import->unusable = true;
+                return;
+            }
+        } else {
+            memcpy(merged, shows, (size_t)show_count * sizeof(*merged));
+            merged_count = show_count;
+        }
+        const char **items = (const char **)cbm_arena_alloc(
+            ctx->arena, (size_t)merged_count * sizeof(*items));
+        if (!items) {
+            import->unusable = true;
+            return;
+        }
+        memcpy((void *)items, merged, (size_t)merged_count * sizeof(*items));
+        import->show_names = items;
+        import->show_count = merged_count;
+    }
+
+    if (hide_count > 0) {
+        const char *merged[DART_NAME_LIST_MAX];
+        int merged_count = 0;
+        for (int i = 0; i < import->hide_count && merged_count < DART_NAME_LIST_MAX; i++) {
+            merged[merged_count++] = import->hide_names[i];
+        }
+        for (int i = 0; i < hide_count; i++) {
+            if (!dart_name_in(merged, merged_count, hides[i])) {
+                if (merged_count >= DART_NAME_LIST_MAX) {
+                    import->unusable = true;
+                    return;
+                }
+                merged[merged_count++] = hides[i];
+            }
+        }
+        const char **items = (const char **)cbm_arena_alloc(
+            ctx->arena, (size_t)merged_count * sizeof(*items));
+        if (!items) {
+            import->unusable = true;
+            return;
+        }
+        memcpy((void *)items, merged, (size_t)merged_count * sizeof(*items));
+        import->hide_names = items;
+        import->hide_count = merged_count;
+    }
+}
+
+static int dart_add_cross_import_targets(DartLSPContext *ctx, const char *uri,
+                                         const CBMDartImport *base) {
+    if (!ctx || !uri || !base || !ctx->cross_import_names || !ctx->cross_import_qns) {
+        return 0;
+    }
+    int added = 0;
+    size_t restricted_len = sizeof(DART_CROSS_RESTRICTED_PREFIX) - 1;
+    size_t filter_prefix_len = sizeof(DART_CROSS_EXPORT_FILTER_PREFIX) - 1;
+    for (int i = 0; i < ctx->cross_import_count; i++) {
+        const char *key = ctx->cross_import_names[i];
+        const char *filter = NULL;
+        size_t filter_len = 0;
+        if (key && strncmp(key, DART_CROSS_EXPORT_FILTER_PREFIX, filter_prefix_len) == 0) {
+            filter = key + filter_prefix_len;
+            const char *separator = strchr(filter, '|');
+            if (!separator) {
+                continue;
+            }
+            filter_len = (size_t)(separator - filter);
+            key = separator + 1;
+        }
+        if (key && strncmp(key, DART_CROSS_RESTRICTED_PREFIX, restricted_len) == 0) {
+            key += restricted_len;
+        }
+        if (!key || !ctx->cross_import_qns[i] || strcmp(key, uri) != 0) {
+            continue;
+        }
+        CBMDartImport import = *base;
+        if (filter) {
+            dart_merge_export_filter(ctx, &import, filter, filter_len);
+        }
+        import.module_qn = cbm_arena_strdup(ctx->arena, ctx->cross_import_qns[i]);
+        dart_add_import(ctx, import);
+        added++;
+    }
+    return added;
+}
+
+static void dart_parse_part(DartLSPContext *ctx, TSNode node) {
+    if (dart_is(node, "part_of_directive")) {
+        ctx->is_part_file = true;
+    }
+    TSNode literal = dart_find_kind(node, "string_literal", 5);
+    if (ts_node_is_null(literal)) {
+        return; /* named `part of library.name` has no safe file mapping */
+    }
+    const char *quoted = dart_node_text(ctx, literal);
+    const char *uri = dart_uri_text(ctx, quoted);
+    int added = 0;
+    if (uri && ctx->cross_import_names && ctx->cross_import_qns) {
+        for (int i = 0; i < ctx->cross_import_count; i++) {
+            if (ctx->cross_import_names[i] && ctx->cross_import_qns[i] &&
+                strcmp(ctx->cross_import_names[i], uri) == 0) {
+                dart_add_library_module(ctx, ctx->cross_import_qns[i]);
+                added++;
+            }
+        }
+    }
+    if (added == 0) {
+        dart_add_library_module(ctx, dart_uri_module(ctx, quoted));
+    }
+}
+
 static bool dart_name_in(const char **names, int count, const char *name) {
     for (int i = 0; i < count; i++) {
         if (names[i] && strcmp(names[i], name) == 0) {
@@ -364,7 +696,7 @@ static bool dart_name_in(const char **names, int count, const char *name) {
 }
 
 static bool dart_import_allows(const CBMDartImport *import, const char *name) {
-    if (!import || !name) {
+    if (!import || !name || import->unusable) {
         return false;
     }
     if (import->show_count > 0 && !dart_name_in(import->show_names, import->show_count, name)) {
@@ -375,17 +707,64 @@ static bool dart_import_allows(const CBMDartImport *import, const char *name) {
 
 static void dart_add_import(DartLSPContext *ctx, CBMDartImport import) {
     if (ctx->import_count >= ctx->import_cap) {
-        int cap = ctx->import_cap * 2;
+        int cap = ctx->import_cap > 0 ? ctx->import_cap * 2 : DART_IMPORT_INITIAL_CAP;
         CBMDartImport *items =
             (CBMDartImport *)cbm_arena_alloc(ctx->arena, (size_t)cap * sizeof(CBMDartImport));
         if (!items) {
             return;
         }
-        memcpy(items, ctx->imports, (size_t)ctx->import_count * sizeof(CBMDartImport));
+        if (ctx->imports && ctx->import_count > 0) {
+            memcpy(items, ctx->imports, (size_t)ctx->import_count * sizeof(CBMDartImport));
+        }
         ctx->imports = items;
         ctx->import_cap = cap;
     }
     ctx->imports[ctx->import_count++] = import;
+}
+
+static void dart_add_inherited_part_imports(DartLSPContext *ctx) {
+    if (!ctx || !ctx->cross_import_names || !ctx->cross_import_qns) {
+        return;
+    }
+    size_t prefix_len = sizeof(DART_CROSS_PART_IMPORT_PREFIX) - 1;
+    size_t filter_prefix_len = sizeof(DART_CROSS_PART_FILTER_PREFIX) - 1;
+    for (int i = 0; i < ctx->cross_import_count; i++) {
+        const char *key = ctx->cross_import_names[i];
+        const char *qn = ctx->cross_import_qns[i];
+        if (key && strcmp(key, DART_CROSS_PART_CORE_BLOCKED) == 0) {
+            ctx->part_core_blocked = true;
+            continue;
+        }
+        const char *uri = NULL;
+        const char *filter = NULL;
+        size_t filter_len = 0;
+        if (key && strncmp(key, DART_CROSS_PART_FILTER_PREFIX, filter_prefix_len) == 0) {
+            filter = key + filter_prefix_len;
+            const char *separator = strchr(filter, '|');
+            if (!separator) {
+                continue;
+            }
+            filter_len = (size_t)(separator - filter);
+            uri = separator + 1;
+        } else if (key && strncmp(key, DART_CROSS_PART_IMPORT_PREFIX, prefix_len) == 0) {
+            uri = key + prefix_len;
+        }
+        if (!uri || !qn) {
+            continue;
+        }
+        CBMDartImport import = {0};
+        import.uri = cbm_arena_strdup(ctx->arena, uri);
+        if (filter) {
+            dart_merge_export_filter(ctx, &import, filter, filter_len);
+        }
+        size_t external_prefix_len = sizeof(DART_CROSS_EXTERNAL_MODULE_PREFIX) - 1;
+        if (strncmp(qn, DART_CROSS_EXTERNAL_MODULE_PREFIX, external_prefix_len) == 0) {
+            qn += external_prefix_len;
+            import.external_only = true;
+        }
+        import.module_qn = cbm_arena_strdup(ctx->arena, qn);
+        dart_add_import(ctx, import);
+    }
 }
 
 static void dart_add_field(DartLSPContext *ctx, const char *owner_qn, const char *name,
@@ -433,6 +812,12 @@ static void dart_parse_import(DartLSPContext *ctx, TSNode node) {
     if (ts_node_is_null(spec) || ts_node_is_null(literal)) {
         return;
     }
+    /* Conditional imports select a URI from compile-time environment state
+     * unavailable to this in-process pass. Binding the default URI would be
+     * a confident but platform-dependent guess, so leave the import unusable. */
+    if (dart_count_kind(spec, "string_literal", 8, 2) > 1) {
+        return;
+    }
     CBMDartImport import = {0};
     import.uri = dart_node_text(ctx, literal);
     import.module_qn = dart_uri_module(ctx, import.uri);
@@ -467,10 +852,16 @@ static void dart_parse_import(DartLSPContext *ctx, TSNode node) {
                 continue;
             }
             const char *value = dart_node_text(ctx, name);
-            if (is_show && show_count < DART_NAME_LIST_MAX) {
-                shows[show_count++] = value;
-            } else if (!is_show && hide_count < DART_NAME_LIST_MAX) {
+            if (is_show) {
+                if (show_count < DART_NAME_LIST_MAX) {
+                    shows[show_count++] = value;
+                } else {
+                    import.unusable = true;
+                }
+            } else if (hide_count < DART_NAME_LIST_MAX) {
                 hides[hide_count++] = value;
+            } else {
+                import.unusable = true;
             }
         }
     }
@@ -480,6 +871,8 @@ static void dart_parse_import(DartLSPContext *ctx, TSNode node) {
         if (import.show_names) {
             memcpy((void *)import.show_names, shows, (size_t)show_count * sizeof(const char *));
             import.show_count = show_count;
+        } else {
+            import.unusable = true;
         }
     }
     if (hide_count > 0) {
@@ -488,9 +881,14 @@ static void dart_parse_import(DartLSPContext *ctx, TSNode node) {
         if (import.hide_names) {
             memcpy((void *)import.hide_names, hides, (size_t)hide_count * sizeof(const char *));
             import.hide_count = hide_count;
+        } else {
+            import.unusable = true;
         }
     }
-    dart_add_import(ctx, import);
+    const char *uri = dart_uri_text(ctx, import.uri);
+    if (dart_add_cross_import_targets(ctx, uri, &import) == 0) {
+        dart_add_import(ctx, import);
+    }
 }
 
 static bool dart_has_explicit_core_import(DartLSPContext *ctx) {
@@ -546,6 +944,36 @@ static char *dart_clean_type_name(DartLSPContext *ctx, const char *name) {
     return clean;
 }
 
+static void dart_unique_candidate(const char **candidate, bool *ambiguous, const char *qn) {
+    if (!qn || !qn[0] || *ambiguous) {
+        return;
+    }
+    if (!*candidate) {
+        *candidate = qn;
+    } else if (strcmp(*candidate, qn) != 0) {
+        *ambiguous = true;
+    }
+}
+
+static bool dart_private_name(const char *name) {
+    return name && name[0] == '_';
+}
+
+static bool dart_import_candidate_allowed(const DartLSPContext *ctx,
+                                          const CBMDartImport *import, const char *qn) {
+    if (!import || !import->external_only || !ctx || !qn) {
+        return true;
+    }
+    for (int i = 0; i < ctx->cross_def_count; i++) {
+        const CBMLSPDef *def = &ctx->cross_defs[i];
+        if (def->lang == CBM_LANG_DART && def->qualified_name &&
+            strcmp(def->qualified_name, qn) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 const char *dart_resolve_class_name(DartLSPContext *ctx, const char *name) {
     char *clean = dart_clean_type_name(ctx, name);
     if (!clean || !*clean || strcmp(clean, "dynamic") == 0 || strcmp(clean, "void") == 0) {
@@ -560,6 +988,12 @@ const char *dart_resolve_class_name(DartLSPContext *ctx, const char *name) {
     if (dot) {
         *dot = '\0';
         const char *member = dot + 1;
+        if (dart_private_name(member)) {
+            *dot = '.';
+            return NULL;
+        }
+        const char *candidate = NULL;
+        bool ambiguous = false;
         for (int i = 0; i < ctx->import_count; i++) {
             const CBMDartImport *import = &ctx->imports[i];
             if (!import->prefix || strcmp(import->prefix, clean) != 0 ||
@@ -567,31 +1001,53 @@ const char *dart_resolve_class_name(DartLSPContext *ctx, const char *name) {
                 continue;
             }
             const char *qn = dart_library_type_qn(ctx, import->module_qn, member);
-            if (qn) {
-                return qn;
+            if (qn && dart_import_candidate_allowed(ctx, import, qn)) {
+                dart_unique_candidate(&candidate, &ambiguous, qn);
             }
         }
         *dot = '.';
-        return NULL;
+        return ambiguous ? NULL : candidate;
     }
 
-    const char *local_qn = dart_join(ctx->arena, ctx->module_qn, clean);
-    if (cbm_registry_lookup_type(ctx->registry, local_qn)) {
-        return local_qn;
+    const char *candidate = NULL;
+    bool ambiguous = false;
+    for (int i = 0; i < ctx->library_module_count; i++) {
+        const char *local_qn = dart_join(ctx->arena, ctx->library_modules[i], clean);
+        if (cbm_registry_lookup_type(ctx->registry, local_qn)) {
+            dart_unique_candidate(&candidate, &ambiguous, local_qn);
+        }
     }
-    for (int i = 0; i < ctx->import_count; i++) {
-        const CBMDartImport *import = &ctx->imports[i];
-        if (import->prefix || !import->module_qn || !dart_import_allows(import, clean)) {
-            continue;
+    if (ambiguous) {
+        return NULL;
+    }
+    if (candidate) {
+        return candidate;
+    }
+
+    if (!dart_private_name(clean)) {
+        for (int i = 0; i < ctx->import_count; i++) {
+            const CBMDartImport *import = &ctx->imports[i];
+            if (import->prefix || !import->module_qn || !dart_import_allows(import, clean)) {
+                continue;
+            }
+            const char *qn = dart_library_type_qn(ctx, import->module_qn, clean);
+            if (qn && dart_import_candidate_allowed(ctx, import, qn)) {
+                dart_unique_candidate(&candidate, &ambiguous, qn);
+            }
         }
-        const char *qn = dart_library_type_qn(ctx, import->module_qn, clean);
-        if (qn) {
-            return qn;
-        }
+    }
+    if (ambiguous) {
+        return NULL;
+    }
+    if (candidate) {
+        return candidate;
     }
 
     bool explicit_core = dart_has_explicit_core_import(ctx);
-    bool core_allowed = !explicit_core;
+    /* Parts normally share the owner's implicit core import. A sentinel from
+     * the project-wide extraction blocks it when the owner explicitly applies
+     * core combinators that this compact map cannot reproduce exactly. */
+    bool core_allowed = !explicit_core && !ctx->part_core_blocked;
     if (explicit_core) {
         for (int i = 0; i < ctx->import_count; i++) {
             const CBMDartImport *import = &ctx->imports[i];
@@ -619,24 +1075,44 @@ const char *dart_resolve_function_name(DartLSPContext *ctx, const char *name) {
     if (!ctx || !name || !*name) {
         return NULL;
     }
-    const char *local_qn = dart_join(ctx->arena, ctx->module_qn, name);
-    const CBMRegisteredFunc *local = cbm_registry_lookup_func(ctx->registry, local_qn);
-    if (local && !local->receiver_type) {
-        return local->qualified_name;
+    const char *candidate = NULL;
+    bool ambiguous = false;
+    for (int i = 0; i < ctx->library_module_count; i++) {
+        const char *local_qn = dart_join(ctx->arena, ctx->library_modules[i], name);
+        const CBMRegisteredFunc *local = cbm_registry_lookup_func(ctx->registry, local_qn);
+        if (local && !local->receiver_type) {
+            dart_unique_candidate(&candidate, &ambiguous, local->qualified_name);
+        }
     }
-    for (int i = 0; i < ctx->import_count; i++) {
-        const CBMDartImport *import = &ctx->imports[i];
-        if (import->prefix || !import->module_qn || !dart_import_allows(import, name)) {
-            continue;
+    if (ambiguous) {
+        return NULL;
+    }
+    if (candidate) {
+        return candidate;
+    }
+
+    if (!dart_private_name(name)) {
+        for (int i = 0; i < ctx->import_count; i++) {
+            const CBMDartImport *import = &ctx->imports[i];
+            if (import->prefix || !import->module_qn || !dart_import_allows(import, name)) {
+                continue;
+            }
+            const char *qn = dart_join(ctx->arena, import->module_qn, name);
+            const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
+            if (func && !func->receiver_type &&
+                dart_import_candidate_allowed(ctx, import, func->qualified_name)) {
+                dart_unique_candidate(&candidate, &ambiguous, func->qualified_name);
+            }
         }
-        const char *qn = dart_join(ctx->arena, import->module_qn, name);
-        const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
-        if (func && !func->receiver_type) {
-            return func->qualified_name;
-        }
+    }
+    if (ambiguous) {
+        return NULL;
+    }
+    if (candidate) {
+        return candidate;
     }
     bool explicit_core = dart_has_explicit_core_import(ctx);
-    bool core_allowed = !explicit_core;
+    bool core_allowed = !explicit_core && !ctx->part_core_blocked;
     if (explicit_core) {
         for (int i = 0; i < ctx->import_count; i++) {
             const CBMDartImport *import = &ctx->imports[i];
@@ -1225,7 +1701,11 @@ static void dart_build_registry(DartLSPContext *ctx, TSNode root) {
     for (uint32_t i = 0; i < count; i++) {
         TSNode node = ts_node_named_child(root, i);
         if (dart_is(node, "import_or_export")) {
-            dart_parse_import(ctx, node);
+            if (!ts_node_is_null(dart_find_kind(node, "library_import", 3))) {
+                dart_parse_import(ctx, node);
+            }
+        } else if (dart_is(node, "part_directive") || dart_is(node, "part_of_directive")) {
+            dart_parse_part(ctx, node);
         }
     }
     dart_register_type_skeletons(ctx, root);
@@ -1475,6 +1955,56 @@ static bool dart_part_is_member(TSNode node) {
            dart_is(node, "conditional_assignable_selector") || dart_is(node, "cascade_selector");
 }
 
+static const CBMRegisteredType *dart_prefixed_type(DartLSPContext *ctx, const char *prefix,
+                                                   const char *member) {
+    if (!ctx || !prefix || !member || dart_private_name(member)) {
+        return NULL;
+    }
+    const CBMRegisteredType *candidate = NULL;
+    for (int i = 0; i < ctx->import_count; i++) {
+        const CBMDartImport *import = &ctx->imports[i];
+        if (!import->prefix || strcmp(import->prefix, prefix) != 0 || !import->module_qn ||
+            !dart_import_allows(import, member)) {
+            continue;
+        }
+        const char *qn = dart_join(ctx->arena, import->module_qn, member);
+        const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
+        if (!type || !dart_import_candidate_allowed(ctx, import, type->qualified_name)) {
+            continue;
+        }
+        if (candidate && strcmp(candidate->qualified_name, type->qualified_name) != 0) {
+            return NULL;
+        }
+        candidate = type;
+    }
+    return candidate;
+}
+
+static const CBMRegisteredFunc *dart_prefixed_func(DartLSPContext *ctx, const char *prefix,
+                                                   const char *member) {
+    if (!ctx || !prefix || !member || dart_private_name(member)) {
+        return NULL;
+    }
+    const CBMRegisteredFunc *candidate = NULL;
+    for (int i = 0; i < ctx->import_count; i++) {
+        const CBMDartImport *import = &ctx->imports[i];
+        if (!import->prefix || strcmp(import->prefix, prefix) != 0 || !import->module_qn ||
+            !dart_import_allows(import, member)) {
+            continue;
+        }
+        const char *qn = dart_join(ctx->arena, import->module_qn, member);
+        const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
+        if (!func || !dart_import_candidate_allowed(ctx, import, func->qualified_name)) {
+            continue;
+        }
+        if (candidate && strcmp(candidate->qualified_name, func->qualified_name) != 0) {
+            return NULL;
+        }
+        candidate = func;
+    }
+    return candidate;
+}
+
 static const CBMType *dart_apply_property(DartLSPContext *ctx, const CBMType *receiver,
                                           const char *base_name, const char *member,
                                           const char *module_qn, bool is_class_ref,
@@ -1486,18 +2016,18 @@ static const CBMType *dart_apply_property(DartLSPContext *ctx, const CBMType *re
         return cbm_type_unknown();
     }
     if (module_qn) {
-        const CBMDartImport *import = base_name ? dart_import_for_prefix(ctx, base_name) : NULL;
-        if (import && !dart_import_allows(import, member)) {
-            return cbm_type_unknown();
-        }
-        const char *qn = dart_join(ctx->arena, module_qn, member);
-        if (cbm_registry_lookup_type(ctx->registry, qn)) {
+        const CBMRegisteredType *imported_type =
+            base_name ? dart_prefixed_type(ctx, base_name, member) : NULL;
+        const char *qn = imported_type ? imported_type->qualified_name
+                                       : dart_join(ctx->arena, module_qn, member);
+        if (imported_type || (!base_name && cbm_registry_lookup_type(ctx->registry, qn))) {
             if (result_is_class_ref) {
                 *result_is_class_ref = true;
             }
             return cbm_type_named(ctx->arena, qn);
         }
-        const CBMRegisteredFunc *getter = cbm_registry_lookup_func(ctx->registry, qn);
+        const CBMRegisteredFunc *getter = base_name ? dart_prefixed_func(ctx, base_name, member)
+                                                    : cbm_registry_lookup_func(ctx->registry, qn);
         if (getter && (getter->flags & CBM_FUNC_FLAG_PROPERTY)) {
             dart_emit(ctx, getter->qualified_name, "lsp_dart_import_getter", DART_CONF_PROPERTY);
             return dart_resolved_return_type(ctx, receiver, getter);
@@ -1508,10 +2038,16 @@ static const CBMType *dart_apply_property(DartLSPContext *ctx, const CBMType *re
     if (!receiver_qn) {
         return cbm_type_unknown();
     }
+    bool private_member = dart_private_name(member);
     const CBMRegisteredFunc *getter =
-        is_class_ref ? cbm_registry_lookup_method_aliased(ctx->registry, receiver_qn, member)
-                     : dart_lookup_method(ctx, receiver_qn, member);
+        (is_class_ref || private_member)
+            ? cbm_registry_lookup_method_aliased(ctx->registry, receiver_qn, member)
+            : dart_lookup_method(ctx, receiver_qn, member);
     if (getter && (getter->flags & CBM_FUNC_FLAG_PROPERTY)) {
+        const char *declaring_type = getter->receiver_type ? getter->receiver_type : receiver_qn;
+        if (!dart_private_member_allowed(ctx, declaring_type, member)) {
+            return cbm_type_unknown();
+        }
         bool getter_is_static = (getter->flags & CBM_FUNC_FLAG_STATICMETHOD) != 0;
         if (getter_is_static != is_class_ref) {
             return cbm_type_unknown();
@@ -1522,6 +2058,10 @@ static const CBMType *dart_apply_property(DartLSPContext *ctx, const CBMType *re
     if (is_class_ref) {
         const CBMDartFieldInfo *field = dart_find_direct_field(ctx, receiver_qn, member);
         return field && field->is_static ? field->type : cbm_type_unknown();
+    }
+    if (private_member) {
+        const CBMDartFieldInfo *field = dart_find_direct_field(ctx, receiver_qn, member);
+        return field && !field->is_static ? field->type : cbm_type_unknown();
     }
     const CBMType *field = dart_lookup_property_type(ctx, receiver_qn, member);
     if (!cbm_type_is_unknown(field)) {
@@ -1537,20 +2077,26 @@ static const CBMType *dart_apply_call(DartLSPContext *ctx, const CBMType *receiv
     dart_eval_arguments(ctx, arguments);
     if (member) {
         if (module_qn) {
-            const CBMDartImport *import = base_name ? dart_import_for_prefix(ctx, base_name) : NULL;
-            if (import && !dart_import_allows(import, member)) {
-                return cbm_type_unknown();
+            const CBMRegisteredFunc *func = base_name ? dart_prefixed_func(ctx, base_name, member)
+                                                      : NULL;
+            const CBMRegisteredType *type = base_name ? dart_prefixed_type(ctx, base_name, member)
+                                                      : NULL;
+            const char *qn = type ? type->qualified_name
+                                  : (func ? func->qualified_name
+                                          : dart_join(ctx->arena, module_qn, member));
+            if (!base_name) {
+                func = cbm_registry_lookup_func(ctx->registry, qn);
+                type = cbm_registry_lookup_type(ctx->registry, qn);
             }
-            const char *qn = dart_join(ctx->arena, module_qn, member);
-            const CBMRegisteredFunc *func = cbm_registry_lookup_func(ctx->registry, qn);
             if (func && !func->receiver_type) {
-                dart_emit(ctx, func->qualified_name, "lsp_dart_import", DART_CONF_TOP_LEVEL);
+                dart_emit_with_reason(ctx, func->qualified_name, "lsp_dart_import",
+                                      DART_CONF_TOP_LEVEL, base_name);
                 return dart_return_type(func);
             }
-            const CBMRegisteredType *type = cbm_registry_lookup_type(ctx->registry, qn);
             if (type && func && (func->flags & CBM_DART_FUNC_FLAG_CONSTRUCTOR) &&
                 (!type->is_interface || (func->flags & CBM_DART_FUNC_FLAG_FACTORY))) {
-                dart_emit(ctx, qn, "lsp_dart_constructor", DART_CONF_CONSTRUCTOR);
+                dart_emit_with_reason(ctx, qn, "lsp_dart_constructor", DART_CONF_CONSTRUCTOR,
+                                      base_name);
                 return cbm_type_named(ctx->arena, qn);
             }
             return cbm_type_unknown();
@@ -1563,6 +2109,10 @@ static const CBMType *dart_apply_call(DartLSPContext *ctx, const CBMType *receiv
             is_class_ref ? cbm_registry_lookup_method_aliased(ctx->registry, receiver_qn, member)
                          : dart_lookup_method(ctx, receiver_qn, member);
         if (!func) {
+            return cbm_type_unknown();
+        }
+        const char *declaring_type = func->receiver_type ? func->receiver_type : receiver_qn;
+        if (!dart_private_member_allowed(ctx, declaring_type, member)) {
             return cbm_type_unknown();
         }
         bool func_is_static = (func->flags & CBM_FUNC_FLAG_STATICMETHOD) != 0;
@@ -2364,4 +2914,384 @@ void cbm_run_dart_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     dart_lsp_process_file(&ctx, root);
 }
 
+/* ── Cross-file registry + entry point ───────────────────────────── */
+
+static bool dart_cross_type_label(const char *label) {
+    return label && (strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+                     strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0 ||
+                     strcmp(label, "Struct") == 0);
+}
+
+static bool dart_cross_callable_label(const char *label) {
+    return label && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+                     strcmp(label, "Constructor") == 0);
+}
+
+static char *dart_cross_trim(CBMArena *arena, const char *start, size_t len) {
+    while (len > 0 && isspace((unsigned char)*start)) {
+        start++;
+        len--;
+    }
+    while (len > 0 && isspace((unsigned char)start[len - 1])) {
+        len--;
+    }
+    while (len > 0 && (start[len - 1] == '?' || start[len - 1] == '!')) {
+        len--;
+    }
+    return len > 0 ? cbm_arena_strndup(arena, start, len) : NULL;
+}
+
+static const char *dart_cross_builtin_qn(const char *name) {
+    if (!name) {
+        return NULL;
+    }
+    static const char *core[] = {"Object",   "String",   "int",      "double", "num",
+                                 "bool",     "List",     "Map",      "Set",    "Iterable",
+                                 "Iterator", "Duration", "DateTime", "RegExp", "Null",
+                                 "void",     NULL};
+    for (int i = 0; core[i]; i++) {
+        if (strcmp(core[i], name) == 0) {
+            static _Thread_local char qn[64];
+            snprintf(qn, sizeof(qn), "dart.core.%s", name);
+            return qn;
+        }
+    }
+    if (strcmp(name, "Future") == 0 || strcmp(name, "Stream") == 0 ||
+        strcmp(name, "FutureOr") == 0) {
+        static _Thread_local char async_qn[64];
+        snprintf(async_qn, sizeof(async_qn), "dart.async.%s", name);
+        return async_qn;
+    }
+    return NULL;
+}
+
+static const char *dart_cross_resolve_type_qn(CBMArena *arena, const CBMTypeRegistry *reg,
+                                               const char *def_module_qn, const char *name) {
+    if (!name || !name[0] || strcmp(name, "dynamic") == 0 || strcmp(name, "Never") == 0) {
+        return NULL;
+    }
+    if (cbm_registry_lookup_type(reg, name)) {
+        return cbm_arena_strdup(arena, name);
+    }
+    if (def_module_qn && def_module_qn[0]) {
+        const char *local = dart_join(arena, def_module_qn, name);
+        if (cbm_registry_lookup_type(reg, local)) {
+            return local;
+        }
+    }
+    const char *builtin = dart_cross_builtin_qn(name);
+    if (builtin && cbm_registry_lookup_type(reg, builtin)) {
+        return cbm_arena_strdup(arena, builtin);
+    }
+    /* A definition's imported-type environment is not present in CBMLSPDef.
+     * Do not bind an unqualified type to a same-named declaration elsewhere
+     * in the project; unknown is safer than a confident cross-library edge. */
+    return NULL;
+}
+
+static const CBMType *dart_cross_parse_type(CBMArena *arena, const CBMTypeRegistry *reg,
+                                             const char *def_module_qn, const char *text,
+                                             int depth) {
+    if (!text || depth > 8) {
+        return cbm_type_unknown();
+    }
+    const char *bar = strchr(text, '|');
+    size_t len = bar ? (size_t)(bar - text) : strlen(text);
+    char *clean = dart_cross_trim(arena, text, len);
+    if (!clean || !clean[0]) {
+        return cbm_type_unknown();
+    }
+    char *lt = strchr(clean, '<');
+    if (!lt) {
+        const char *qn = dart_cross_resolve_type_qn(arena, reg, def_module_qn, clean);
+        return qn ? cbm_type_named(arena, qn) : cbm_type_unknown();
+    }
+    char *gt = strrchr(lt + 1, '>');
+    if (!gt || gt[1] != '\0') {
+        return cbm_type_unknown();
+    }
+    *lt = '\0';
+    *gt = '\0';
+    const char *base_qn = dart_cross_resolve_type_qn(arena, reg, def_module_qn, clean);
+    if (!base_qn) {
+        return cbm_type_unknown();
+    }
+    const CBMType *args[8];
+    int arg_count = 0;
+    char *arg_start = lt + 1;
+    int nesting = 0;
+    for (char *p = arg_start;; p++) {
+        char c = *p;
+        if (c == '<') {
+            nesting++;
+        } else if (c == '>') {
+            nesting--;
+        }
+        if ((c == ',' && nesting == 0) || c == '\0') {
+            if (arg_count >= 8) {
+                return cbm_type_unknown();
+            }
+            char saved = c;
+            *p = '\0';
+            args[arg_count++] =
+                dart_cross_parse_type(arena, reg, def_module_qn, arg_start, depth + 1);
+            *p = saved;
+            if (c == '\0') {
+                break;
+            }
+            arg_start = p + 1;
+        }
+    }
+    return cbm_type_template(arena, base_qn, args, arg_count);
+}
+
+static void dart_cross_register_type(CBMTypeRegistry *reg, const CBMLSPDef *def) {
+    if (!def->qualified_name || !def->short_name || !dart_cross_type_label(def->label)) {
+        return;
+    }
+    CBMRegisteredType type = {0};
+    type.qualified_name = def->qualified_name;
+    type.short_name = def->short_name;
+    type.is_interface = def->is_interface || strcmp(def->label, "Interface") == 0;
+    cbm_registry_add_type(reg, type);
+}
+
+static void dart_cross_fill_type(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *def) {
+    CBMRegisteredType *type =
+        (CBMRegisteredType *)cbm_registry_lookup_type(reg, def->qualified_name);
+    if (!type) {
+        return;
+    }
+    if (def->embedded_types && def->embedded_types[0]) {
+        int count = 1;
+        for (const char *p = def->embedded_types; *p; p++) {
+            if (*p == '|') {
+                count++;
+            }
+        }
+        const char **parents =
+            (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(*parents));
+        if (parents) {
+            int n = 0;
+            const char *start = def->embedded_types;
+            while (*start) {
+                const char *end = strchr(start, '|');
+                size_t len = end ? (size_t)(end - start) : strlen(start);
+                char *name = dart_cross_trim(arena, start, len);
+                const CBMType *parent =
+                    dart_cross_parse_type(arena, reg, def->def_module_qn, name, 0);
+                const char *qn = dart_type_qn(parent);
+                if (qn) {
+                    parents[n++] = qn;
+                }
+                if (!end) {
+                    break;
+                }
+                start = end + 1;
+            }
+            parents[n] = NULL;
+            type->embedded_types = parents;
+        }
+    }
+    if (def->field_defs && def->field_defs[0]) {
+        int count = 1;
+        for (const char *p = def->field_defs; *p; p++) {
+            if (*p == '|') {
+                count++;
+            }
+        }
+        const char **names =
+            (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(*names));
+        const CBMType **types =
+            (const CBMType **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(*types));
+        if (names && types) {
+            int n = 0;
+            const char *start = def->field_defs;
+            while (*start) {
+                const char *end = strchr(start, '|');
+                size_t len = end ? (size_t)(end - start) : strlen(start);
+                const char *colon = memchr(start, ':', len);
+                if (colon && colon > start && colon + 1 < start + len) {
+                    names[n] = dart_cross_trim(arena, start, (size_t)(colon - start));
+                    char *field_type =
+                        dart_cross_trim(arena, colon + 1, (size_t)((start + len) - colon - 1));
+                    types[n] = dart_cross_parse_type(arena, reg, def->def_module_qn, field_type, 0);
+                    if (names[n] && !cbm_type_is_unknown(types[n])) {
+                        n++;
+                    }
+                }
+                if (!end) {
+                    break;
+                }
+                start = end + 1;
+            }
+            names[n] = NULL;
+            types[n] = NULL;
+            type->field_names = names;
+            type->field_types = types;
+        }
+    }
+}
+
+static const char *dart_cross_receiver(CBMArena *arena, const CBMTypeRegistry *reg,
+                                       const CBMLSPDef *def) {
+    if (def->receiver_type && def->receiver_type[0]) {
+        return dart_cross_resolve_type_qn(arena, reg, def->def_module_qn, def->receiver_type);
+    }
+    if (!def->label || strcmp(def->label, "Constructor") != 0 || !def->qualified_name) {
+        return NULL;
+    }
+    if (cbm_registry_lookup_type(reg, def->qualified_name)) {
+        return def->qualified_name;
+    }
+    const char *dot = strrchr(def->qualified_name, '.');
+    if (!dot) {
+        return NULL;
+    }
+    char *owner = cbm_arena_strndup(arena, def->qualified_name,
+                                    (size_t)(dot - def->qualified_name));
+    return cbm_registry_lookup_type(reg, owner) ? owner : NULL;
+}
+
+static void dart_cross_register_callable(CBMArena *arena, CBMTypeRegistry *reg,
+                                         const CBMLSPDef *def) {
+    if (!def->qualified_name || !def->short_name || !dart_cross_callable_label(def->label)) {
+        return;
+    }
+    bool method = strcmp(def->label, "Method") == 0;
+    bool constructor = strcmp(def->label, "Constructor") == 0;
+    if (method && !(def->callable_flags & CBM_DEF_CALLABLE_KNOWN)) {
+        return;
+    }
+    /* Generic extraction currently does not preserve enough constructor
+     * detail to distinguish default, named, factory, and redirecting forms.
+     * Setter syntax likewise is not an invocation. Both conservatively miss. */
+    if (method && (def->callable_flags &
+                   (CBM_DEF_CALLABLE_CONSTRUCTOR | CBM_DEF_CALLABLE_SETTER))) {
+        return;
+    }
+    const char *receiver = (method || constructor) ? dart_cross_receiver(arena, reg, def) : NULL;
+    if ((method || constructor) && !receiver) {
+        return;
+    }
+    CBMRegisteredFunc func = {0};
+    func.qualified_name = def->qualified_name;
+    func.short_name = def->short_name;
+    func.receiver_type = receiver;
+    func.min_params = -1;
+    if (constructor) {
+        func.flags = CBM_FUNC_FLAG_STATICMETHOD | CBM_DART_FUNC_FLAG_CONSTRUCTOR;
+        func.signature = dart_signature(arena, cbm_type_named(arena, receiver));
+    } else {
+        if (method && (def->callable_flags & CBM_DEF_CALLABLE_STATIC)) {
+            func.flags |= CBM_FUNC_FLAG_STATICMETHOD;
+        }
+        if (method && (def->callable_flags & CBM_DEF_CALLABLE_GETTER)) {
+            func.flags |= CBM_FUNC_FLAG_PROPERTY;
+        }
+    }
+    if (!constructor && def->return_types && def->return_types[0]) {
+        const CBMType *ret =
+            dart_cross_parse_type(arena, reg, def->def_module_qn, def->return_types, 0);
+        if (!cbm_type_is_unknown(ret)) {
+            func.signature = dart_signature(arena, ret);
+        }
+    }
+    cbm_registry_add_func(reg, func);
+}
+
+static const char *dart_cross_project_name(CBMArena *arena, const char *module_qn) {
+    if (!module_qn) {
+        return "";
+    }
+    const char *dot = strchr(module_qn, '.');
+    return dot ? cbm_arena_strndup(arena, module_qn, (size_t)(dot - module_qn)) : module_qn;
+}
+
+void cbm_run_dart_lsp_cross_with_path(
+    CBMArena *arena, const char *source, int source_len, const char *module_qn,
+    const char *rel_path, CBMLSPDef *defs, int def_count, const char **import_names,
+    const char **import_qns, int import_count, TSTree *cached_tree, CBMResolvedCallArray *out) {
+    if (!arena || !source || source_len < 0 || !out) {
+        return;
+    }
+    CBMTypeRegistry registry;
+    cbm_registry_init(&registry, arena);
+    cbm_dart_stdlib_register(&registry, arena);
+    cbm_dart_flutter_seed_register(&registry, arena);
+
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        if (def->lang == CBM_LANG_DART &&
+            (!def->def_module_qn || !module_qn || strcmp(def->def_module_qn, module_qn) != 0)) {
+            dart_cross_register_type(&registry, def);
+        }
+    }
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        if (def->lang == CBM_LANG_DART && dart_cross_type_label(def->label) &&
+            (!def->def_module_qn || !module_qn || strcmp(def->def_module_qn, module_qn) != 0)) {
+            dart_cross_fill_type(arena, &registry, def);
+        }
+    }
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *def = &defs[i];
+        if (def->lang == CBM_LANG_DART &&
+            (!def->def_module_qn || !module_qn || strcmp(def->def_module_qn, module_qn) != 0)) {
+            dart_cross_register_callable(arena, &registry, def);
+        }
+    }
+
+    CBMArena index_arena;
+    cbm_arena_init(&index_arena);
+    cbm_registry_finalize_into(&registry, &index_arena);
+
+    TSTree *tree = cached_tree;
+    bool owns_tree = false;
+    if (!tree) {
+        TSParser *parser = ts_parser_new();
+        if (parser) {
+            if (ts_parser_set_language(parser, tree_sitter_dart())) {
+                tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+            }
+            ts_parser_delete(parser);
+        }
+        owns_tree = tree != NULL;
+    }
+    if (!tree) {
+        cbm_arena_destroy(&index_arena);
+        return;
+    }
+
+    DartLSPContext ctx;
+    dart_lsp_init(&ctx, arena, source, source_len, &registry, module_qn ? module_qn : "",
+                  dart_cross_project_name(arena, module_qn), rel_path, out);
+    ctx.cross_import_names = import_names;
+    ctx.cross_import_qns = import_qns;
+    ctx.cross_import_count = import_count;
+    ctx.cross_defs = defs;
+    ctx.cross_def_count = def_count;
+    dart_add_inherited_part_imports(&ctx);
+    dart_lsp_process_file(&ctx, ts_tree_root_node(tree));
+
+    cbm_arena_destroy(&index_arena);
+    if (owns_tree) {
+        ts_tree_delete(tree);
+    }
+}
+
+void cbm_run_dart_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns,
+                            int import_count, TSTree *cached_tree, CBMResolvedCallArray *out) {
+    cbm_run_dart_lsp_cross_with_path(arena, source, source_len, module_qn, NULL, defs, def_count,
+                                     import_names, import_qns, import_count, cached_tree, out);
+}
+
 #undef TS_FIELD
+#undef DART_CROSS_PART_IMPORT_PREFIX
+#undef DART_CROSS_PART_FILTER_PREFIX
+#undef DART_CROSS_PART_CORE_BLOCKED
+#undef DART_CROSS_RESTRICTED_PREFIX
+#undef DART_CROSS_EXPORT_FILTER_PREFIX
+#undef DART_CROSS_EXTERNAL_MODULE_PREFIX

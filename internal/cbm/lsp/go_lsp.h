@@ -87,6 +87,7 @@ typedef struct {
     bool is_interface;
     CBMLanguage lang;           // language of the file that defined this — used by Tier 2 per-language registry build to filter all_defs
     const char* namespace_name; // declared namespace/package for source-root-independent JVM filtering
+    uint32_t callable_flags;    // CBM_DEF_CALLABLE_*; KNOWN gates modifier-sensitive dispatch
 } CBMLSPDef;
 
 // Parse source, build registry from defs + stdlib, run LSP.

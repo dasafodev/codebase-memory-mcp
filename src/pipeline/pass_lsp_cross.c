@@ -22,12 +22,14 @@
 #include "lsp/php_lsp.h"
 #include "lsp/java_lsp.h"
 #include "lsp/kotlin_lsp.h"
+#include "lsp/dart_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_cargo.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
+#include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
 #include <stdio.h>
@@ -40,6 +42,13 @@ enum {
     PXC_MAX_FILE_BYTES_FACTOR = 100, /* same cap pass_calls.c uses for source size */
     PXC_ITOA_BUF = 16,
 };
+
+#define PXC_DART_PART_IMPORT_PREFIX "@dart-part-import:"
+#define PXC_DART_PART_FILTER_PREFIX "@dart-part-filter:"
+#define PXC_DART_PART_CORE_BLOCKED "@dart-part-core-blocked"
+#define PXC_DART_RESTRICTED_PREFIX "@dart-restricted:"
+#define PXC_DART_EXPORT_FILTER_PREFIX "@dart-export-filter:"
+#define PXC_DART_EXTERNAL_MODULE_PREFIX "@dart-external-module:"
 
 /* Format an int into a thread-local rotating buffer for log key=value emission.
  * Mirrors the itoa_log helper in pass_calls.c — kept local so passes don't
@@ -261,6 +270,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->return_types = src->return_type;
     dst->embedded_types = pxc_join_pipe(arena, src->base_classes);
     dst->lang = lang;
+    dst->callable_flags = src->callable_flags;
     return 0;
 }
 
@@ -311,13 +321,280 @@ CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t
     return defs;
 }
 
-/* Build per-file import map (local_name -> resolved module QN) from gbuf
- * IMPORTS edges. Mirrors build_import_map() in pass_parallel.c. Returns 0
- * with *out_count = 0 when the file has no IMPORTS edges. Caller frees keys
- * with pxc_free_import_map. */
-static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
-                                const char *rel_path, const char ***out_keys,
-                                const char ***out_vals, int *out_count) {
+static char *pxc_edge_string(const char *properties, const char *field) {
+    if (!properties || !field) {
+        return NULL;
+    }
+    char needle[CBM_SZ_128];
+    int n = snprintf(needle, sizeof(needle), "\"%s\":\"", field);
+    if (n <= 0 || (size_t)n >= sizeof(needle)) {
+        return NULL;
+    }
+    const char *start = strstr(properties, needle);
+    if (!start) {
+        return NULL;
+    }
+    start += (size_t)n;
+    const char *end = start;
+    while (*end) {
+        if (*end == '"' && (end == start || end[-1] != '\\')) {
+            break;
+        }
+        end++;
+    }
+    if (!*end) {
+        return NULL;
+    }
+    return cbm_strndup(start, (size_t)(end - start));
+}
+
+static char *pxc_dart_target_module(const cbm_gbuf_node_t *target,
+                                    const char *project_name) {
+    if (!target) {
+        return NULL;
+    }
+    if (target->file_path && target->file_path[0]) {
+        return cbm_pipeline_fqn_module(project_name, target->file_path);
+    }
+    if (!target->qualified_name) {
+        return NULL;
+    }
+    static const char suffix[] = ".__file__";
+    size_t len = strlen(target->qualified_name);
+    if (len > sizeof(suffix) - 1 &&
+        strcmp(target->qualified_name + len - (sizeof(suffix) - 1), suffix) == 0) {
+        return cbm_strndup(target->qualified_name, len - (sizeof(suffix) - 1));
+    }
+    return strdup(target->qualified_name);
+}
+
+static const cbm_gbuf_node_t *pxc_target_file(const cbm_gbuf_t *gbuf,
+                                               const cbm_gbuf_node_t *target,
+                                               const char *project_name) {
+    if (!target) {
+        return NULL;
+    }
+    if (target->label && strcmp(target->label, "File") == 0) {
+        return target;
+    }
+    if (!target->file_path || !target->file_path[0]) {
+        return NULL;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project_name, target->file_path, "__file__");
+    const cbm_gbuf_node_t *file = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
+    free(file_qn);
+    return file;
+}
+
+static bool pxc_import_map_append(const char ***keys, const char ***vals, int *count, int *cap,
+                                  const char *key, char *owned_value) {
+    if (!key || !key[0] || !owned_value || !owned_value[0]) {
+        free(owned_value);
+        return false;
+    }
+    if (*count >= *cap) {
+        int new_cap = *cap > 0 ? *cap * 2 : 8;
+        const char **new_keys = (const char **)realloc((void *)*keys,
+                                                       (size_t)new_cap * sizeof(**keys));
+        if (!new_keys) {
+            free(owned_value);
+            return false;
+        }
+        *keys = new_keys;
+        const char **new_vals = (const char **)realloc((void *)*vals,
+                                                       (size_t)new_cap * sizeof(**vals));
+        if (!new_vals) {
+            free(owned_value);
+            return false;
+        }
+        *vals = new_vals;
+        *cap = new_cap;
+    }
+    char *owned_key = strdup(key);
+    if (!owned_key) {
+        free(owned_value);
+        return false;
+    }
+    (*keys)[*count] = owned_key;
+    (*vals)[*count] = owned_value;
+    (*count)++;
+    return true;
+}
+
+static void pxc_dart_append_parts(const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *library,
+                                  const char *project_name, const char *key, const char ***keys,
+                                  const char ***vals, int *count, int *cap) {
+    const cbm_gbuf_node_t *file = pxc_target_file(gbuf, library, project_name);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file || cbm_gbuf_find_edges_by_source_type(gbuf, file->id, "IMPORTS", &edges,
+                                                    &edge_count) != 0) {
+        return;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        char *kind = pxc_edge_string(edges[i]->properties_json, "kind");
+        bool is_part = kind && strcmp(kind, "part") == 0;
+        free(kind);
+        if (!is_part) {
+            continue;
+        }
+        const cbm_gbuf_node_t *part = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        char *part_qn = pxc_dart_target_module(part, project_name);
+        (void)pxc_import_map_append(keys, vals, count, cap, key, part_qn);
+    }
+}
+
+static const CBMFileResult *pxc_cached_result_for_path(CBMFileResult *const *result_cache,
+                                                        const cbm_file_info_t *files,
+                                                        int file_count, const char *file_path) {
+    if (!result_cache || !files || file_count <= 0 || !file_path) {
+        return NULL;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (result_cache[i] && files[i].rel_path && strcmp(files[i].rel_path, file_path) == 0) {
+            return result_cache[i];
+        }
+    }
+    return NULL;
+}
+
+static char *pxc_dart_external_module(const char *uri) {
+    if (!uri) {
+        return NULL;
+    }
+    if (strncmp(uri, "dart:", 5) == 0 && uri[5]) {
+        size_t tail_len = strlen(uri + 5);
+        char *qn = (char *)malloc(sizeof("dart.") + tail_len);
+        if (!qn) {
+            return NULL;
+        }
+        memcpy(qn, "dart.", sizeof("dart.") - 1);
+        memcpy(qn + sizeof("dart.") - 1, uri + 5, tail_len + 1);
+        for (char *p = qn + sizeof("dart.") - 1; *p; p++) {
+            if (*p == '/') {
+                *p = '.';
+            }
+        }
+        return qn;
+    }
+    if (strncmp(uri, "package:", 8) != 0) {
+        return NULL;
+    }
+    const char *package = uri + 8;
+    const char *slash = strchr(package, '/');
+    if (!slash || slash == package || !slash[1]) {
+        return NULL;
+    }
+    char *package_name = cbm_strndup(package, (size_t)(slash - package));
+    if (!package_name) {
+        return NULL;
+    }
+    size_t path_len = strlen(slash + 1);
+    char *path = (char *)malloc(sizeof("lib/") + path_len);
+    if (!path) {
+        free(package_name);
+        return NULL;
+    }
+    memcpy(path, "lib/", sizeof("lib/") - 1);
+    memcpy(path + sizeof("lib/") - 1, slash + 1, path_len + 1);
+    char *qn = cbm_pipeline_fqn_module(package_name, path);
+    free(path);
+    free(package_name);
+    return qn;
+}
+
+static char *pxc_dart_mark_external_module(char *module_qn) {
+    if (!module_qn) {
+        return NULL;
+    }
+    size_t prefix_len = sizeof(PXC_DART_EXTERNAL_MODULE_PREFIX) - 1;
+    size_t qn_len = strlen(module_qn);
+    char *marked = (char *)malloc(prefix_len + qn_len + 1);
+    if (marked) {
+        memcpy(marked, PXC_DART_EXTERNAL_MODULE_PREFIX, prefix_len);
+        memcpy(marked + prefix_len, module_qn, qn_len + 1);
+    }
+    free(module_qn);
+    return marked;
+}
+
+static const char *pxc_dart_part_import_key(char *buf, size_t cap, const char *uri,
+                                            const char *details) {
+    if (!buf || cap == 0 || !uri || !uri[0]) {
+        return NULL;
+    }
+    int len = details && details[0]
+                  ? snprintf(buf, cap, "%s%s|%s", PXC_DART_PART_FILTER_PREFIX, details, uri)
+                  : snprintf(buf, cap, "%s%s", PXC_DART_PART_IMPORT_PREFIX, uri);
+    return len > 0 && (size_t)len < cap ? buf : NULL;
+}
+
+static void pxc_dart_append_owner_import_namespace(
+    const cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *imported, const char *project_name,
+    const char *uri, const char *details, const char ***keys, const char ***vals, int *count,
+    int *cap) {
+    char base_key[CBM_SZ_4K];
+    const char *key = pxc_dart_part_import_key(base_key, sizeof(base_key), uri, details);
+    char *module_qn = pxc_dart_target_module(imported, project_name);
+    if (!pxc_import_map_append(keys, vals, count, cap, key, module_qn)) {
+        return;
+    }
+    const cbm_gbuf_node_t *file = pxc_target_file(gbuf, imported, project_name);
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (!file || cbm_gbuf_find_edges_by_source_type(gbuf, file->id, "IMPORTS", &edges,
+                                                    &edge_count) != 0) {
+        return;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        char *kind = pxc_edge_string(edges[i]->properties_json, "kind");
+        bool is_part = kind && strcmp(kind, "part") == 0;
+        bool is_export = kind && strcmp(kind, "export") == 0;
+        bool is_restricted_export = kind && strcmp(kind, "export_restricted") == 0;
+        if (!is_part && !is_export && !is_restricted_export) {
+            free(kind);
+            continue;
+        }
+        char filtered_details[CBM_SZ_2K];
+        const char *target_details = details;
+        char *export_details = NULL;
+        if (is_restricted_export) {
+            export_details = pxc_edge_string(edges[i]->properties_json, "details");
+            int combined_len = export_details && export_details[0]
+                                   ? snprintf(filtered_details, sizeof(filtered_details), "%s%s",
+                                              details ? details : "", export_details)
+                                   : -1;
+            target_details = combined_len > 0 && (size_t)combined_len < sizeof(filtered_details)
+                                 ? filtered_details
+                                 : NULL;
+            if (!target_details) {
+                free(export_details);
+                free(kind);
+                continue;
+            }
+        }
+        char target_key_buf[CBM_SZ_4K];
+        const char *target_key =
+            pxc_dart_part_import_key(target_key_buf, sizeof(target_key_buf), uri, target_details);
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[i]->target_id);
+        char *target_qn = pxc_dart_target_module(target, project_name);
+        (void)pxc_import_map_append(keys, vals, count, cap, target_key, target_qn);
+        if (is_export || is_restricted_export) {
+            pxc_dart_append_parts(gbuf, target, project_name, target_key, keys, vals, count, cap);
+        }
+        free(export_details);
+        free(kind);
+    }
+}
+
+/* Build per-file import map from graph IMPORTS edges. Dart uses the original
+ * URI as the key (needed because every `*.dart` otherwise collapses to the
+ * local name "dart") and expands one level of export edges. */
+int cbm_pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name,
+                             const char *rel_path, CBMLanguage lang,
+                             CBMFileResult *const *result_cache,
+                             const cbm_file_info_t *files, int file_count,
+                             const char ***out_keys, const char ***out_vals, int *out_count) {
     *out_keys = NULL;
     *out_vals = NULL;
     *out_count = 0;
@@ -337,35 +614,169 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
     if (rc != 0 || edge_count == 0)
         return 0;
 
-    const char **keys = (const char **)calloc((size_t)edge_count, sizeof(const char *));
-    const char **vals = (const char **)calloc((size_t)edge_count, sizeof(const char *));
-    if (!keys || !vals) {
-        free(keys);
-        free(vals);
-        return 0;
-    }
+    const char **keys = NULL;
+    const char **vals = NULL;
     int count = 0;
+    int cap = 0;
     for (int i = 0; i < edge_count; i++) {
         const cbm_gbuf_edge_t *e = edges[i];
         const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, e->target_id);
         if (!target || !e->properties_json)
             continue;
-        const char *start = strstr(e->properties_json, "\"local_name\":\"");
-        if (!start)
-            continue;
-        start += strlen("\"local_name\":\"");
-        const char *end = strchr(start, '"');
-        if (!end || end <= start)
-            continue;
-        size_t n = (size_t)(end - start);
-        char *local = (char *)malloc(n + 1);
-        if (!local)
-            continue;
-        memcpy(local, start, n);
-        local[n] = '\0';
-        keys[count] = local;
-        vals[count] = target->qualified_name; /* borrowed from gbuf */
-        count++;
+        char *local = pxc_edge_string(e->properties_json, "local_name");
+        char *module_path = pxc_edge_string(e->properties_json, "module_path");
+        char *kind = pxc_edge_string(e->properties_json, "kind");
+        char restricted_key[CBM_SZ_1K];
+        const char *key = lang == CBM_LANG_DART && module_path && module_path[0] ? module_path
+                                                                                : local;
+        if (lang == CBM_LANG_DART && kind && strcmp(kind, "import_restricted") == 0) {
+            int n = snprintf(restricted_key, sizeof(restricted_key), "%s%s",
+                             PXC_DART_RESTRICTED_PREFIX, module_path ? module_path : "");
+            key = n > 0 && (size_t)n < sizeof(restricted_key) ? restricted_key : NULL;
+        }
+        char *target_qn = lang == CBM_LANG_DART
+                              ? pxc_dart_target_module(target, project_name)
+                              : (target->qualified_name ? strdup(target->qualified_name) : NULL);
+        bool dart_scope_edge = !kind || strcmp(kind, "import") == 0 ||
+                               strcmp(kind, "import_restricted") == 0 ||
+                               strcmp(kind, "part") == 0 || strcmp(kind, "part_of") == 0;
+        if (lang != CBM_LANG_DART || dart_scope_edge) {
+            (void)pxc_import_map_append(&keys, &vals, &count, &cap, key, target_qn);
+        } else {
+            free(target_qn);
+        }
+
+        /* `import 'barrel.dart'` exposes the barrel's exports. Keep the
+         * caller's URI as the key so its show/hide/as combinators apply to
+         * both the barrel and each one-level re-export target. */
+        if (lang == CBM_LANG_DART &&
+            (!kind || strcmp(kind, "import") == 0 || strcmp(kind, "import_restricted") == 0)) {
+            const cbm_gbuf_node_t *target_file = pxc_target_file(gbuf, target, project_name);
+            const cbm_gbuf_edge_t **exports = NULL;
+            int export_count = 0;
+            if (target_file &&
+                cbm_gbuf_find_edges_by_source_type(gbuf, target_file->id, "IMPORTS", &exports,
+                                                   &export_count) == 0) {
+                for (int j = 0; j < export_count; j++) {
+                    char *export_kind =
+                        pxc_edge_string(exports[j]->properties_json, "kind");
+                    bool is_export = export_kind && strcmp(export_kind, "export") == 0;
+                    bool is_restricted_export =
+                        export_kind && strcmp(export_kind, "export_restricted") == 0;
+                    bool is_part = export_kind && strcmp(export_kind, "part") == 0;
+                    if (!is_export && !is_restricted_export && !is_part) {
+                        free(export_kind);
+                        continue;
+                    }
+                    const cbm_gbuf_node_t *export_target =
+                        cbm_gbuf_find_by_id(gbuf, exports[j]->target_id);
+                    char filtered_key[CBM_SZ_2K];
+                    const char *target_key = key;
+                    char *details = NULL;
+                    if (is_restricted_export) {
+                        details = pxc_edge_string(exports[j]->properties_json, "details");
+                        int filtered_len =
+                            details && details[0]
+                                ? snprintf(filtered_key, sizeof(filtered_key), "%s%s|%s",
+                                           PXC_DART_EXPORT_FILTER_PREFIX, details, key ? key : "")
+                                : -1;
+                        target_key = filtered_len > 0 && (size_t)filtered_len < sizeof(filtered_key)
+                                         ? filtered_key
+                                         : NULL;
+                    }
+                    char *export_qn = pxc_dart_target_module(export_target, project_name);
+                    (void)pxc_import_map_append(&keys, &vals, &count, &cap, target_key, export_qn);
+                    if (is_export || is_restricted_export) {
+                        /* A re-exported library includes declarations in its
+                         * parts; keep them under the caller's original URI. */
+                        pxc_dart_append_parts(gbuf, export_target, project_name, target_key, &keys,
+                                              &vals, &count, &cap);
+                    }
+                    free(details);
+                    free(export_kind);
+                }
+            }
+        }
+
+        /* A part file inherits its owner's whole library scope. Add sibling
+         * parts under the part-of URI so dart_parse_part treats them as one
+         * library, and add unrestricted owner imports through a reserved key
+         * that the Dart resolver recognizes. Non-graph-backed SDK/package
+         * imports come from the cached extraction result; restricted core is
+         * represented by a block sentinel rather than guessed. */
+        if (lang == CBM_LANG_DART && kind && strcmp(kind, "part_of") == 0) {
+            const cbm_gbuf_node_t *owner_file = pxc_target_file(gbuf, target, project_name);
+            const cbm_gbuf_edge_t **owner_edges = NULL;
+            int owner_edge_count = 0;
+            if (owner_file &&
+                cbm_gbuf_find_edges_by_source_type(gbuf, owner_file->id, "IMPORTS", &owner_edges,
+                                                   &owner_edge_count) == 0) {
+                for (int j = 0; j < owner_edge_count; j++) {
+                    char *owner_kind =
+                        pxc_edge_string(owner_edges[j]->properties_json, "kind");
+                    const cbm_gbuf_node_t *owner_target =
+                        cbm_gbuf_find_by_id(gbuf, owner_edges[j]->target_id);
+                    if (owner_kind && strcmp(owner_kind, "part") == 0) {
+                        char *sibling_qn = pxc_dart_target_module(owner_target, project_name);
+                        (void)pxc_import_map_append(&keys, &vals, &count, &cap, key, sibling_qn);
+                    } else if (owner_kind &&
+                               (strcmp(owner_kind, "import") == 0 ||
+                                strcmp(owner_kind, "import_restricted") == 0)) {
+                        char *owner_uri =
+                            pxc_edge_string(owner_edges[j]->properties_json, "module_path");
+                        char *owner_details =
+                            pxc_edge_string(owner_edges[j]->properties_json, "details");
+                        bool restricted = strcmp(owner_kind, "import_restricted") == 0;
+                        if (!restricted || (owner_details && owner_details[0])) {
+                            pxc_dart_append_owner_import_namespace(
+                                gbuf, owner_target, project_name, owner_uri, owner_details, &keys,
+                                &vals, &count, &cap);
+                        }
+                        free(owner_details);
+                        free(owner_uri);
+                    }
+                    free(owner_kind);
+                }
+            }
+            const CBMFileResult *owner_result =
+                owner_file ? pxc_cached_result_for_path(result_cache, files, file_count,
+                                                         owner_file->file_path)
+                           : NULL;
+            if (owner_result) {
+                for (int j = 0; j < owner_result->imports.count; j++) {
+                    const CBMImport *owner_import = &owner_result->imports.items[j];
+                    if (!owner_import->kind || !owner_import->module_path) {
+                        continue;
+                    }
+                    bool restricted = strcmp(owner_import->kind, "import_restricted") == 0;
+                    if (strcmp(owner_import->kind, "import") != 0 && !restricted) {
+                        continue;
+                    }
+                    if (restricted && (!owner_import->details || !owner_import->details[0])) {
+                        if (strcmp(owner_import->module_path, "dart:core") == 0) {
+                            (void)pxc_import_map_append(
+                                &keys, &vals, &count, &cap, PXC_DART_PART_CORE_BLOCKED,
+                                strdup("dart.core"));
+                        }
+                        continue;
+                    }
+                    char *external_qn = pxc_dart_mark_external_module(
+                        pxc_dart_external_module(owner_import->module_path));
+                    if (!external_qn) {
+                        continue;
+                    }
+                    char inherited_key[CBM_SZ_4K];
+                    const char *key = pxc_dart_part_import_key(
+                        inherited_key, sizeof(inherited_key), owner_import->module_path,
+                        restricted ? owner_import->details : NULL);
+                    (void)pxc_import_map_append(
+                        &keys, &vals, &count, &cap, key, external_qn);
+                }
+            }
+        }
+        free(local);
+        free(module_path);
+        free(kind);
     }
     *out_keys = keys;
     *out_vals = vals;
@@ -373,13 +784,17 @@ static int pxc_build_import_map(const cbm_gbuf_t *gbuf, const char *project_name
     return 0;
 }
 
-static void pxc_free_import_map(const char **keys, const char **vals, int count) {
+void cbm_pxc_free_import_map(const char **keys, const char **vals, int count) {
     if (keys) {
         for (int i = 0; i < count; i++)
             free((void *)keys[i]);
         free((void *)keys);
     }
-    free((void *)vals); /* vals strings borrowed from gbuf — don't free elements */
+    if (vals) {
+        for (int i = 0; i < count; i++)
+            free((void *)vals[i]);
+        free((void *)vals);
+    }
 }
 
 /* Detect TS dialect flags from a relative path. */
@@ -414,6 +829,7 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_CSHARP: /* tier-2 prebuilt registry path (pass_parallel.c) */
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
+    case CBM_LANG_DART:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_RUST:   /* fallback cbm_pxc_run_one path (manifest-aware) */
         return true;
     default:
@@ -535,8 +951,8 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * 1100-file repo before this fix). Output gets copied into the file's own
  * arena and merged into result->resolved_calls. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
-                     const char **imp_qns, int imp_count) {
+                     const char *module_qn, const char *rel_path, CBMLSPDef *defs, int def_count,
+                     const char **imp_names, const char **imp_qns, int imp_count) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -576,6 +992,10 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     case CBM_LANG_KOTLIN:
         cbm_run_kotlin_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count,
                                  imp_names, imp_qns, imp_count, tree, &out);
+        break;
+    case CBM_LANG_DART:
+        cbm_run_dart_lsp_cross_with_path(&scratch, source, source_len, module_qn, rel_path, defs,
+                                         def_count, imp_names, imp_qns, imp_count, tree, &out);
         break;
     case CBM_LANG_RUST: {
         /* The Rust resolver wants CBMRustLSPDef (rust_lsp.h), not the
@@ -745,8 +1165,8 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                                                  &result->resolved_calls,
                                                  /*result=*/NULL);
         } else {
-            cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+            cbm_pxc_run_one(lang, result, source, source_len, def_module, rel, file_defs,
+                            file_def_count, imp_keys, imp_vals, imp_count);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -756,7 +1176,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         cbm_pxc_run_one_ts(result, source, source_len, def_module, file_defs, file_def_count,
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
-        cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
+        cbm_pxc_run_one(lang, result, source, source_len, def_module, rel, file_defs, file_def_count,
                         imp_keys, imp_vals, imp_count);
     }
     free(filtered);
@@ -877,8 +1297,8 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, &imp_keys, &imp_vals,
-                             &imp_count);
+        cbm_pxc_build_import_map(ctx->gbuf, ctx->project_name, files[i].rel_path, lang, cache,
+                                 files, file_count, &imp_keys, &imp_vals, &imp_count);
 
         /* Journal around the resolve: a hang here must be attributed to THIS
          * file, not to a stale extraction marker (the innocent-quarantine
@@ -891,7 +1311,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         per_lang_calls++;
         processed++;
 
-        pxc_free_import_map(imp_keys, imp_vals, imp_count);
+        cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count);
         free(source);
     }
 

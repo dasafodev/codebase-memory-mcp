@@ -1014,12 +1014,121 @@ static bool find_first_descendant_of(TSNode node, const char *type, // NOLINT(mi
     return false;
 }
 
+static int count_descendants_of(TSNode node, const char *type, int limit) {
+    if (ts_node_is_null(node) || limit <= 0) {
+        return 0;
+    }
+    int count = strcmp(ts_node_type(node), type) == 0 ? 1 : 0;
+    uint32_t n = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < n && count < limit; i++) {
+        count += count_descendants_of(ts_node_named_child(node, i), type, limit - count);
+    }
+    return count;
+}
+
+static bool append_dart_detail(char *buf, size_t cap, size_t *len, const char *text,
+                               size_t text_len) {
+    if (!buf || !len || !text || *len >= cap || text_len >= cap - *len) {
+        return false;
+    }
+    memcpy(buf + *len, text, text_len);
+    *len += text_len;
+    buf[*len] = '\0';
+    return true;
+}
+
+/* Serialize Dart show/hide combinators without retaining the whole directive.
+ * The compact form is stable inside IMPORTS edge metadata:
+ *   S:Visible,AlsoVisible;H:Hidden;
+ * A malformed/oversized restriction returns NULL so the cross pass abstains. */
+static bool collect_dart_combinators(CBMExtractCtx *ctx, TSNode node, char *buf, size_t cap,
+                                     size_t *len, bool *found) {
+    if (strcmp(ts_node_type(node), "combinator") == 0) {
+        char *text = cbm_node_text(ctx->arena, node, ctx->source);
+        const char marker = text && strncmp(text, "show", 4) == 0
+                                ? 'S'
+                                : (text && strncmp(text, "hide", 4) == 0 ? 'H' : '\0');
+        if (!marker || !append_dart_detail(buf, cap, len, &marker, 1) ||
+            !append_dart_detail(buf, cap, len, ":", 1)) {
+            return false;
+        }
+        bool have_name = false;
+        uint32_t child_count = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < child_count; i++) {
+            TSNode child = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(child), "identifier") != 0) {
+                continue;
+            }
+            char *name = cbm_node_text(ctx->arena, child, ctx->source);
+            if (!name || !name[0] ||
+                (have_name && !append_dart_detail(buf, cap, len, ",", 1)) ||
+                !append_dart_detail(buf, cap, len, name, strlen(name))) {
+                return false;
+            }
+            have_name = true;
+        }
+        if (!have_name || !append_dart_detail(buf, cap, len, ";", 1)) {
+            return false;
+        }
+        *found = true;
+        return true;
+    }
+    uint32_t child_count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        if (!collect_dart_combinators(ctx, ts_node_named_child(node, i), buf, cap, len, found)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static const char *dart_import_prefix(CBMExtractCtx *ctx, TSNode node) {
+    if (strcmp(ts_node_type(node), "import_specification") == 0) {
+        bool saw_as = false;
+        uint32_t child_count = ts_node_child_count(node);
+        for (uint32_t i = 0; i < child_count; i++) {
+            TSNode child = ts_node_child(node, i);
+            const char *kind = ts_node_type(child);
+            if (!ts_node_is_named(child) && strcmp(kind, "as") == 0) {
+                saw_as = true;
+            } else if (saw_as && strcmp(kind, "identifier") == 0) {
+                return cbm_node_text(ctx->arena, child, ctx->source);
+            }
+        }
+    }
+    uint32_t child_count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        const char *prefix = dart_import_prefix(ctx, ts_node_named_child(node, i));
+        if (prefix) {
+            return prefix;
+        }
+    }
+    return NULL;
+}
+
+static const char *dart_directive_details(CBMExtractCtx *ctx, TSNode node) {
+    char buf[CBM_SZ_1K] = {0};
+    size_t len = 0;
+    bool found = false;
+    const char *prefix = dart_import_prefix(ctx, node);
+    if (prefix) {
+        found = true;
+        if (!append_dart_detail(buf, sizeof(buf), &len, "P:", 2) ||
+            !append_dart_detail(buf, sizeof(buf), &len, prefix, strlen(prefix)) ||
+            !append_dart_detail(buf, sizeof(buf), &len, ";", 1)) {
+            return NULL;
+        }
+    }
+    if (!collect_dart_combinators(ctx, node, buf, sizeof(buf), &len, &found) || !found) {
+        return NULL;
+    }
+    return cbm_arena_strndup(ctx->arena, buf, len);
+}
+
 // --- Dart imports ---
-// tree-sitter-dart wraps each top-level import as `import_or_export`; the URI is
-// a `string_literal` nested under library_import -> import_specification ->
-// configurable_uri -> uri. The old dispatch matched "import_declaration" (which
-// tree-sitter-dart never emits) -> 0 imports. Find the first string_literal under
-// each import_or_export and strip its quotes.
+// tree-sitter-dart wraps imports/exports in `import_or_export` and emits parts
+// as `part_directive` / `part_of_directive`. Preserve the directive kind so the
+// cross-file pass can distinguish visibility from re-export and library sharing.
 static void parse_dart_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -1029,14 +1138,48 @@ static void parse_dart_imports(CBMExtractCtx *ctx) {
     }
     do {
         TSNode node = ts_tree_cursor_current_node(&cursor);
-        if (strcmp(ts_node_type(node), "import_or_export") != 0) {
+        const char *node_kind = ts_node_type(node);
+        const char *import_kind = NULL;
+        if (strcmp(node_kind, "import_or_export") == 0) {
+            TSNode export_node = node;
+            bool is_export = find_first_descendant_of(node, "library_export", &export_node);
+            bool conditional = count_descendants_of(node, "string_literal", 2) > 1;
+            if (conditional) {
+                import_kind = is_export ? "export_conditional" : "import_conditional";
+            } else if (is_export) {
+                TSNode combinator = node;
+                /* The cross pass cannot safely collapse an export visibility
+                 * filter into a module-only import map. Mark it restricted so
+                 * it abstains instead of exposing hidden declarations. */
+                import_kind = find_first_descendant_of(node, "combinator", &combinator)
+                                  ? "export_restricted"
+                                  : "export";
+            } else {
+                TSNode combinator = node;
+                char *directive_text = cbm_node_text(a, node, ctx->source);
+                bool restricted = find_first_descendant_of(node, "combinator", &combinator) ||
+                                  (directive_text && strstr(directive_text, " as "));
+                import_kind = restricted ? "import_restricted" : "import";
+            }
+        } else if (strcmp(node_kind, "part_directive") == 0) {
+            import_kind = "part";
+        } else if (strcmp(node_kind, "part_of_directive") == 0) {
+            import_kind = "part_of";
+        } else {
             continue;
         }
         TSNode uri = node;
         if (find_first_descendant_of(node, "string_literal", &uri)) {
             char *path = strip_quotes(a, cbm_node_text(a, uri, ctx->source));
             if (path && path[0]) {
-                CBMImport imp = {.local_name = path_last(a, path), .module_path = path};
+                CBMImport imp = {
+                    .local_name = path_last(a, path),
+                    .module_path = path,
+                    .kind = import_kind,
+                    .details = import_kind && strstr(import_kind, "restricted")
+                                   ? dart_directive_details(ctx, node)
+                                   : NULL,
+                };
                 cbm_imports_push(&ctx->result->imports, a, imp);
             }
         }

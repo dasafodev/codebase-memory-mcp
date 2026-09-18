@@ -3,6 +3,7 @@
  */
 #include "cli/config_text_edit.h"
 
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
@@ -442,13 +443,26 @@ static int text_read_file(const char *path, char **data_out, size_t *len_out,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    int descriptor = open(path, flags);
+    /* A symlink the invoking user owns, inside an opted-in configuration
+     * root, is read through the descriptor the helper validated on the
+     * target's pinned parent directory (#1954); everything else is opened by
+     * name with O_NOFOLLOW exactly as before. */
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(path, &target) < 0) {
+        return TEXT_ERROR;
+    }
+    int descriptor = target.fd;
+    target.fd = -1;
+    if (target.status != CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        descriptor = open(target.path, flags);
+    }
+    cbm_config_edit_target_close(&target);
     if (descriptor < 0) {
         if (errno != ENOENT) {
             return TEXT_ERROR;
         }
         struct stat path_state;
-        if (lstat(path, &path_state) == 0 || errno != ENOENT) {
+        if (lstat(target.path, &path_state) == 0 || errno != ENOENT) {
             return TEXT_ERROR;
         }
         char *empty = (char *)calloc(1U, 1U);
@@ -589,14 +603,35 @@ static int text_replace_file(const char *temp_path, const char *path, int destin
 #endif
 }
 
-static int text_write_atomic_mode(const char *path, const char *new_data, size_t new_len,
-                                  const char *old_data, size_t old_len,
-                                  const text_file_snapshot_t *snapshot, int override_mode,
-                                  unsigned int requested_mode) {
+static const char *text_temp_name(const char *temp_path) {
+    const char *slash = strrchr(temp_path, '/');
+    return slash ? slash + 1 : temp_path;
+}
+
+/* Drop a staged temp file: through the pinned parent for a followed link,
+ * by name otherwise. */
+static void text_discard_temp(const cbm_config_edit_target_t *target, const char *temp_path) {
+    if (target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        (void)cbm_config_edit_target_unlink(target, text_temp_name(temp_path));
+    } else {
+        (void)cbm_unlink(temp_path);
+    }
+}
+
+/* For a followed link (#1954) the temp file is created with openat() beside
+ * the target and published with renameat() on the pinned parent, so the link
+ * itself is never replaced; every pre-publish comparison runs against the
+ * resolved path. A direct path keeps the by-name sequence unchanged. */
+static int text_write_atomic_mode_at(const cbm_config_edit_target_t *target, const char *new_data,
+                                     size_t new_len, const char *old_data, size_t old_len,
+                                     const text_file_snapshot_t *snapshot, int override_mode,
+                                     unsigned int requested_mode) {
     if (new_len > TEXT_MAX_BYTES || old_len > TEXT_MAX_BYTES ||
         !text_requested_mode_valid(override_mode, requested_mode)) {
         return TEXT_ERROR;
     }
+    const char *path = target->path;
+    bool followed = target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED;
     int content_same =
         new_len == old_len && (new_len == 0U || memcmp(new_data, old_data, new_len) == 0);
 #ifndef _WIN32
@@ -643,13 +678,15 @@ static int text_write_atomic_mode(const char *path, const char *new_data, size_t
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
-        int descriptor = open(temp_path, flags, 0600);
+        int descriptor =
+            followed ? cbm_config_edit_target_create_temp(target, text_temp_name(temp_path), 0600U)
+                     : open(temp_path, flags, 0600);
         if (descriptor >= 0) {
             file = text_fdopen(descriptor, "wb");
             if (!file) {
                 int saved_error = errno;
                 text_close(descriptor);
-                (void)cbm_unlink(temp_path);
+                text_discard_temp(target, temp_path);
                 errno = saved_error;
             }
         }
@@ -702,7 +739,7 @@ static int text_write_atomic_mode(const char *path, const char *new_data, size_t
         failed = 1;
     }
     if (failed) {
-        (void)cbm_unlink(temp_path);
+        text_discard_temp(target, temp_path);
         free(temp_path);
         return TEXT_ERROR;
     }
@@ -718,7 +755,7 @@ static int text_write_atomic_mode(const char *path, const char *new_data, size_t
         !text_snapshot_publication_equal(&trusted_temp_snapshot, &temp_snapshot) ||
         temp_len != new_len || (new_len != 0U && memcmp(temp_data, new_data, new_len) != 0)) {
         free(temp_data);
-        (void)cbm_unlink(temp_path);
+        text_discard_temp(target, temp_path);
         free(temp_path);
         return TEXT_ERROR;
     }
@@ -730,7 +767,7 @@ static int text_write_atomic_mode(const char *path, const char *new_data, size_t
     }
 #endif
     if (text_snapshot_matches_path(path, old_data, old_len, snapshot) != TEXT_OK) {
-        (void)cbm_unlink(temp_path);
+        text_discard_temp(target, temp_path);
         free(temp_path);
         return TEXT_ERROR;
     }
@@ -741,13 +778,28 @@ static int text_write_atomic_mode(const char *path, const char *new_data, size_t
 #endif
     if (text_snapshot_matches_path(path, old_data, old_len, snapshot) != TEXT_OK ||
         text_snapshot_matches_path(temp_path, new_data, new_len, &temp_snapshot) != TEXT_OK ||
-        text_replace_file(temp_path, path, snapshot->exists) != TEXT_OK) {
-        (void)cbm_unlink(temp_path);
+        (followed ? cbm_config_edit_target_commit(target, text_temp_name(temp_path))
+                  : text_replace_file(temp_path, path, snapshot->exists)) != TEXT_OK) {
+        text_discard_temp(target, temp_path);
         free(temp_path);
         return TEXT_ERROR;
     }
     free(temp_path);
     return TEXT_OK;
+}
+
+static int text_write_atomic_mode(const char *requested_path, const char *new_data, size_t new_len,
+                                  const char *old_data, size_t old_len,
+                                  const text_file_snapshot_t *snapshot, int override_mode,
+                                  unsigned int requested_mode) {
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(requested_path, &target) < 0) {
+        return TEXT_ERROR;
+    }
+    int result = text_write_atomic_mode_at(&target, new_data, new_len, old_data, old_len, snapshot,
+                                           override_mode, requested_mode);
+    cbm_config_edit_target_close(&target);
+    return result;
 }
 
 static int text_write_atomic(const char *path, const char *new_data, size_t new_len,
@@ -1220,6 +1272,58 @@ static int text_matches_candidate(const char *data, size_t data_len, const char 
     *matches =
         data_len == candidate_len && (data_len == 0U || memcmp(data, candidate, data_len) == 0);
     return TEXT_OK;
+}
+
+/* Read-only classification: WOULD a migrate of this document succeed?
+ * Returns TEXT_OK when the path is absent or already byte-identical to the
+ * current or an exact released document (a write would proceed), TEXT_UNOWNED
+ * when it holds other bytes (a write would be refused), TEXT_ERROR on unsafe
+ * state. Mirrors text_migrate_owned_document's decision WITHOUT writing, so
+ * `install --dry-run` can predict a refusal instead of promising an install it
+ * cannot deliver (#1387). */
+int cbm_text_owned_document_status(const char *file_path, const char *current_content,
+                                   const char *const *released_contents, size_t released_count) {
+    size_t current_len = 0U;
+    if (!text_valid_path(file_path) ||
+        text_bounded_strlen(current_content, TEXT_MAX_BYTES, &current_len) != TEXT_OK ||
+        text_validate_bytes(current_content, current_len, 1) != TEXT_OK ||
+        (released_count > 0U && !released_contents)) {
+        return TEXT_ERROR;
+    }
+
+    char *old_data = NULL;
+    size_t old_len = 0U;
+    text_file_snapshot_t snapshot;
+    if (text_read_file(file_path, &old_data, &old_len, &snapshot) != TEXT_OK ||
+        text_validate_bytes(old_data, old_len, 1) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (!snapshot.exists) {
+        free(old_data);
+        return TEXT_OK; /* absent -> the write creates it */
+    }
+    bool matches = false;
+    if (text_matches_candidate(old_data, old_len, current_content, &matches) != TEXT_OK) {
+        free(old_data);
+        return TEXT_ERROR;
+    }
+    if (matches) {
+        free(old_data);
+        return TEXT_OK;
+    }
+    for (size_t i = 0U; i < released_count; i++) {
+        if (text_matches_candidate(old_data, old_len, released_contents[i], &matches) != TEXT_OK) {
+            free(old_data);
+            return TEXT_ERROR;
+        }
+        if (matches) {
+            free(old_data);
+            return TEXT_OK; /* an exact released doc upgrades */
+        }
+    }
+    free(old_data);
+    return TEXT_UNOWNED;
 }
 
 static int text_migrate_owned_document(const char *file_path, const char *current_content,

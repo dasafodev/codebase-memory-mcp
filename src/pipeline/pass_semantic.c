@@ -12,6 +12,7 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "foundation/str_util.h" // cbm_json_escape
 #include "pipeline/pipeline.h"
 #include <stdint.h>
@@ -49,7 +50,7 @@ static char *read_file(const char *path, int *out_len) {
     }
     /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
     enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
+    char *buf = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)size + CBM_TS_LOOKAHEAD_PAD);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -84,8 +85,12 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 
     /* Fast path: build from cached extraction result (no JSON parsing) */
     if (result && result->imports.count > 0) {
-        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
+        const char **keys =
+            cbm_calloc(CBM_MEM_CLASS_SEMANTIC,
+                       (size_t)((size_t)result->imports.count) * (sizeof(const char *)));
+        const char **vals =
+            cbm_calloc(CBM_MEM_CLASS_SEMANTIC,
+                       (size_t)((size_t)result->imports.count) * (sizeof(const char *)));
         int count = 0;
 
         for (int i = 0; i < result->imports.count; i++) {
@@ -99,7 +104,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             if (!target) {
                 continue;
             }
-            keys[count] = strdup(imp->local_name);
+            keys[count] = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, imp->local_name);
             vals[count] = target->qualified_name;
             count++;
         }
@@ -126,8 +131,10 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
         return 0;
     }
 
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
+    const char **keys =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)(edge_count) * (sizeof(const char *)));
+    const char **vals =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)(edge_count) * (sizeof(const char *)));
     int count = 0;
 
     for (int i = 0; i < edge_count; i++) {
@@ -158,12 +165,12 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 static void free_import_map(const char **keys, const char **vals, int count) {
     if (keys) {
         for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)keys[i]);
         }
-        free((void *)keys);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)keys);
     }
     if (vals) {
-        free((void *)vals);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)vals);
     }
 }
 
@@ -400,6 +407,15 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
     if (res.qualified_name && res.qualified_name[0] != '\0') {
         dec = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     }
+    /* A qualified Rust proc-macro path can collide with the decorated
+     * function's own name: resolving `#[tokio::main]` from module `main`
+     * may fall back from `tokio::main` to same-module `main`.  That is not a
+     * local decorator target (and the self-edge is discarded below), so keep
+     * the full external spelling by materialising the synthetic decorator. */
+    if (dec && dec->id == node->id && decorator[0] == '#' && decorator[1] == '[' &&
+        strstr(func_name, "::")) {
+        dec = NULL;
+    }
     if (!dec) {
         /* The decorator target is not a local symbol (external attribute /
          * stdlib annotation / proc-macro derive).  Materialise a synthetic
@@ -454,12 +470,13 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
             if (base_node && node->id != base_node->id) {
                 /* A base that resolves to an Interface is an IMPLEMENTS relation
                  * (Java `implements`, C# `: IFace`, TS `implements`); a Class/
-                 * Type/Enum base is plain INHERITS. */
-                const char *base_label = cbm_registry_label_of(ctx->registry, base_qn);
-                const char *edge_type = (base_label && strcmp(base_label, "Interface") == 0)
-                                            ? "IMPLEMENTS"
-                                            : "INHERITS";
-                cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id, edge_type, "{}");
+                 * Type/Enum base is plain INHERITS. Keyed off the target NODE's
+                 * label — the graph truth the edge attaches to — so the
+                 * sequential and parallel venues cannot diverge (the parallel
+                 * path once hardcoded INHERITS and demoted every explicit
+                 * implements at scale). */
+                cbm_gbuf_insert_edge(ctx->gbuf, node->id, base_node->id,
+                                     cbm_semantic_base_edge_type(base_node), "{}");
                 (*inherits_count)++;
             }
         }
@@ -486,7 +503,7 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
     }
     CBMFileResult *r = cbm_extract_file(source, source_len, fi->language, ctx->project_name,
                                         fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
-    free(source);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, source);
     if (r) {
         *owned = true;
     }
@@ -576,8 +593,77 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
     int go_impl = cbm_pipeline_implements_go(ctx);
     implements_count += go_impl;
 
+    /* ── Explicit-language override detection (full graph, serial) ── */
+    int overrides = cbm_pipeline_override_explicit(ctx);
+
     cbm_log_info("pass.done", "pass", "semantic", "inherits", itoa_log(inherits_count), "decorates",
-                 itoa_log(decorates_count), "implements", itoa_log(implements_count), "errors",
-                 itoa_log(errors));
+                 itoa_log(decorates_count), "implements", itoa_log(implements_count), "overrides",
+                 itoa_log(overrides), "errors", itoa_log(errors));
     return 0;
+}
+
+const char *cbm_semantic_base_edge_type(const cbm_gbuf_node_t *base_node) {
+    return (base_node && base_node->label && strcmp(base_node->label, "Interface") == 0)
+               ? "IMPLEMENTS"
+               : "INHERITS";
+}
+
+/* Create OVERRIDE edges from one class's methods to same-named methods of one
+ * explicit base (interface or superclass). */
+static int override_match_methods(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *cls,
+                                  const cbm_gbuf_node_t *base) {
+    const cbm_gbuf_edge_t **cls_dm = NULL;
+    int cls_dm_count = 0;
+    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cls->id, "DEFINES_METHOD", &cls_dm,
+                                       &cls_dm_count);
+    if (cls_dm_count == 0) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **base_dm = NULL;
+    int base_dm_count = 0;
+    cbm_gbuf_find_edges_by_source_type(ctx->gbuf, base->id, "DEFINES_METHOD", &base_dm,
+                                       &base_dm_count);
+    int created = 0;
+    for (int c = 0; c < cls_dm_count; c++) {
+        const cbm_gbuf_node_t *cm = cbm_gbuf_find_by_id(ctx->gbuf, cls_dm[c]->target_id);
+        if (!cm || !cm->name) {
+            continue;
+        }
+        for (int b = 0; b < base_dm_count; b++) {
+            const cbm_gbuf_node_t *bm = cbm_gbuf_find_by_id(ctx->gbuf, base_dm[b]->target_id);
+            if (bm && bm->name && cm->id != bm->id && strcmp(cm->name, bm->name) == 0) {
+                cbm_gbuf_insert_edge(ctx->gbuf, cm->id, bm->id, "OVERRIDE", "{}");
+                created++;
+                break;
+            }
+        }
+    }
+    return created;
+}
+
+int cbm_pipeline_override_explicit(cbm_pipeline_ctx_t *ctx) {
+    if (!ctx || !ctx->gbuf) {
+        return 0;
+    }
+    int created = 0;
+    static const char *base_edge_types[] = {"IMPLEMENTS", "INHERITS"};
+    for (size_t t = 0; t < sizeof(base_edge_types) / sizeof(base_edge_types[0]); t++) {
+        const cbm_gbuf_edge_t **edges = NULL;
+        int edge_count = 0;
+        cbm_gbuf_find_edges_by_type(ctx->gbuf, base_edge_types[t], &edges, &edge_count);
+        for (int e = 0; e < edge_count; e++) {
+            const cbm_gbuf_node_t *cls = cbm_gbuf_find_by_id(ctx->gbuf, edges[e]->source_id);
+            const cbm_gbuf_node_t *base = cbm_gbuf_find_by_id(ctx->gbuf, edges[e]->target_id);
+            if (!cls || !base) {
+                continue;
+            }
+            /* Go's implicit satisfaction already emits OVERRIDE with interface
+             * semantics; running both would double-cover .go sources. */
+            if (cls->file_path && fp_ends_with(cls->file_path, ".go")) {
+                continue;
+            }
+            created += override_match_methods(ctx, cls, base);
+        }
+    }
+    return created;
 }

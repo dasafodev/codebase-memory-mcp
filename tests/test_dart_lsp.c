@@ -1863,7 +1863,26 @@ TEST(dartlsp_cross_part_inherits_prefixed_filter) {
     PASS();
 }
 
+TEST(dartlsp_http_endpoint_constant_extraction) {
+    CBMFileResult *r = extract_dart_lsp(
+        "class _E { static const bookings = '/bookings'; }\n"
+        "void load(dynamic apiClient) { apiClient.get(_E.bookings); }\n");
+    ASSERT_NOT_NULL(r);
+    bool found = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *call = &r->calls.items[i];
+        if (call->callee_name && strcmp(call->callee_name, "apiClient.get") == 0 &&
+            call->first_string_arg && strcmp(call->first_string_arg, "/bookings") == 0) {
+            found = true;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_TRUE(found);
+    PASS();
+}
+
 SUITE(dart_lsp) {
+    RUN_TEST(dartlsp_http_endpoint_constant_extraction);
     RUN_TEST(dartlsp_core_print);
     RUN_TEST(dartlsp_local_top_level_call);
     RUN_TEST(dartlsp_default_constructor);
